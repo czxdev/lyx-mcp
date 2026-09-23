@@ -1,0 +1,16 @@
+[lyx]
+binary = "/usr/bin/lyx"
+runtime_root = "/tmp"
+startup_timeout_sec = 45
+command_timeout_sec = 30
+export_timeout_sec = 180
+# profile_seed_dir = "/absolute/path/to/a/dedicated/lyx/userdir-template"
+
+[security]
+allowed_roots = ["/absolute/path/to/papers"]
+
+# Optional. The request selects a profile name, never a command string.
+# [checker.paper]
+# command = ["/usr/bin/python3", "/absolute/path/to/check_document.py", "{path}"]
+# timeout_sec = 120
+

@@ -1,0 +1,18 @@
+#LyX 2.4 created this file. For more info see https://www.lyx.org/
+\lyxformat 620
+\begin_document
+\begin_header
+\textclass article
+\language english
+\inputencoding utf8
+\tracking_changes false
+\output_changes false
+\end_header
+
+\begin_body
+\begin_layout Standard
+Alpha beta. Gamma delta. Alpha BETTER.
+\end_layout
+\end_body
+\end_document
+

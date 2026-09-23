@@ -31,6 +31,7 @@ def test_isolated_lyx_edit_compile_and_rollback(tmp_path: Path) -> None:
             assert stat.S_ISFIFO(Path(f"{layout.pipe_stem}.out").stat().st_mode)
             assert "--no-remote" in service.runtime.process.args
             assert str(layout.userdir) in service.runtime.process.args
+            lyx_pid = service.runtime.process.pid
 
             document = tmp_path / "edited.lyx"
             shutil.copy2(FIXTURE, document)
@@ -43,6 +44,7 @@ def test_isolated_lyx_edit_compile_and_rollback(tmp_path: Path) -> None:
             assert result["sha256_before"] != result["sha256_after"]
             assert b"\\change_deleted" in document.read_bytes()
             assert b"\\change_inserted" in document.read_bytes()
+            assert b"\\output_changes true" in document.read_bytes()
             assert document.read_bytes() != baseline
             pdf = Path(result["pdf"])
             assert pdf.read_bytes().startswith(b"%PDF-")
@@ -54,8 +56,9 @@ def test_isolated_lyx_edit_compile_and_rollback(tmp_path: Path) -> None:
                 compile=False,
             )
             assert second_pass["ok"] is True
-            assert b"Gamma delta" in document.read_bytes()
-            assert b"Gamma epsilon" in document.read_bytes()
+            assert (await service.get_document_state(str(document)))["output_changes"] is True
+            assert b"delta" in document.read_bytes()
+            assert b"epsilon" in document.read_bytes()
             assert (await service.get_document_state(str(document)))["tracking_changes"] is True
 
             failed = tmp_path / "failed.lyx"
@@ -95,9 +98,22 @@ def test_isolated_lyx_edit_compile_and_rollback(tmp_path: Path) -> None:
             assert rejected["error_code"] == "PDF_COMPILE_FAILED"
             assert rejected["rollback_verified"] is True
             assert broken.read_bytes() == broken_original
+
+            missing_citation = tmp_path / "missing-citation.lyx"
+            citation = (
+                "\\begin_inset CommandInset citation\nLatexCommand cite\n"
+                'key "NonexistentLyXMCPReference"\nliteral "false"\n\n\\end_inset'
+            )
+            missing_citation.write_text(
+                FIXTURE.read_text().replace("Gamma delta", f"Gamma {citation} delta")
+            )
+            with pytest.raises(LyXMCPError) as undefined:
+                await service.export(str(missing_citation), "pdf2")
+            assert undefined.value.code == "UNDEFINED_CITATIONS"
         finally:
             await service.close()
         assert not layout.root.exists()
+        assert not Path(f"/proc/{lyx_pid}").exists()
 
     asyncio.run(exercise())
 
@@ -177,6 +193,7 @@ def test_real_lyx_text_primitives_and_second_isolated_runtime(tmp_path: Path) ->
                 fingerprint(donor),
             )
             assert result["ok"] is True, result
+            assert b"\\output_changes true" in imported.read_bytes()
             assert Path(result["pdf"]).read_bytes().startswith(b"%PDF-")
             assert b"\\begin_inset Formula $x$" in imported.read_bytes()
             assert b"\\change_inserted" in imported.read_bytes()
@@ -200,5 +217,57 @@ def test_real_lyx_text_primitives_and_second_isolated_runtime(tmp_path: Path) ->
         finally:
             await first.close()
             await second.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.skipif(shutil.which("lyx") is None, reason="LyX is not installed")
+def test_output_changes_unsafe_resizebox_is_repaired(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        document = tmp_path / "unsafe.lyx"
+        old = (
+            "\\begin_inset ERT\nstatus open\n\n\\begin_layout Plain Layout\n"
+            "\\backslash\nresizebox{0.5\\backslash\ntextwidth}{!}{\n\\end_layout\n\\end_inset"
+        )
+        new = (
+            "\\begin_inset ERT\nstatus collapsed\n\n\\begin_layout Plain Layout\n"
+            "\\backslash\nresizebox{\\backslash\ntextwidth}{!}{\n\\end_layout\n\\end_inset"
+        )
+        close = "\\begin_inset ERT\nstatus open\n\n\\begin_layout Plain Layout\n}\n\\end_layout\n\\end_inset"
+        body = (
+            "\\begin_layout Standard\n\\change_deleted 0 100\n"
+            + old
+            + "\n\\change_inserted 0 100\n"
+            + new
+            + "\n\\change_unchanged\nVisible text.\n"
+            + close
+            + "\n\\end_layout"
+        )
+        source = FIXTURE.read_text().replace(
+            "\\begin_layout Standard\nAlpha beta. Gamma delta. Alpha BETTER.\n\\end_layout", body
+        )
+        source = source.replace("\\tracking_changes false", "\\tracking_changes true")
+        source = source.replace(
+            "\\tracking_changes true",
+            "\\begin_preamble\n\\usepackage{graphicx}\n\\end_preamble\n\\tracking_changes true",
+        )
+        source = source.replace("\\end_header", '\\author 0 "Test" ""\n\\end_header')
+        document.write_text(source)
+        service = LyXService(Config(allowed_roots=(tmp_path,), export_timeout_sec=45))
+        await service.start()
+        try:
+            baseline = (await service.read(str(document)))["content"]
+            broken = tmp_path / "broken.lyx"
+            broken.write_text(source.replace("\\output_changes false", "\\output_changes true"))
+            with pytest.raises(LyXMCPError, match="File ended while scanning"):
+                await service.export(str(broken), "pdf2")
+            result = await service.normalize_revisions(str(document), fingerprint(document), 0, 100)
+            assert result["ok"] is True, result
+            assert result["accepted_structural_ert_replacements"] == 1
+            assert result["output_changes"] is True
+            assert (await service.read(str(document)))["content"] == baseline
+            assert Path(result["pdf"]).read_bytes().startswith(b"%PDF-")
+        finally:
+            await service.close()
 
     asyncio.run(exercise())

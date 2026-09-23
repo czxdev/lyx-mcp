@@ -133,3 +133,18 @@ async def lyx_import_revision_range(
     return await ctx.request_context.lifespan_context.service.import_revision_range(
         path, source_path, start_heading, end_heading, expected_sha256, source_sha256, compile
     )
+
+
+@mcp.tool()
+async def lyx_normalize_revisions(
+    path: str,
+    expected_sha256: str,
+    author_id: int,
+    timestamp: int,
+    ctx: Context[AppContext],
+    compile: bool = True,
+) -> dict[str, object]:
+    """Merge fragmented tracked text and accept unsafe resizebox ERT replacements transactionally."""
+    return await ctx.request_context.lifespan_context.service.normalize_revisions(
+        path, expected_sha256, author_id, timestamp, compile
+    )

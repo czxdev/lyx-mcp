@@ -48,6 +48,43 @@ class PlannedEdit:
     target: str
 
 
+def _narrow_replacement(old: str, new: str) -> tuple[int, int, str]:
+    prefix = 0
+    while prefix < min(len(old), len(new)) and old[prefix] == new[prefix]:
+        prefix += 1
+    if prefix == len(old) and prefix == len(new):
+        raise LyXMCPError("NO_EFFECT", "replacement text is identical to the target")
+    suffix = 0
+    while suffix < min(len(old), len(new)) - prefix and old[-suffix - 1] == new[-suffix - 1]:
+        suffix += 1
+    old_end = len(old) - suffix
+    new_end = len(new) - suffix
+    if prefix == old_end:
+        if old_end < len(old) and old[old_end].isalnum():
+            while old_end < len(old) and old[old_end].isalnum():
+                old_end += 1
+                new_end += 1
+        elif prefix:
+            while prefix and old[prefix - 1].isalnum():
+                prefix -= 1
+            if prefix == old_end:
+                prefix -= 1
+    if prefix < len(old) and prefix and old[prefix - 1].isalnum() and old[prefix].isalnum():
+        while prefix and old[prefix - 1].isalnum():
+            prefix -= 1
+    if old_end < len(old) and old_end and old[old_end - 1].isalnum() and old[old_end].isalnum():
+        while old_end < len(old) and old[old_end].isalnum():
+            old_end += 1
+            new_end += 1
+    if "-" in old[prefix:old_end] and not any(character.isalnum() for character in old[prefix:old_end]):
+        while prefix and not old[prefix - 1].isspace():
+            prefix -= 1
+        while old_end < len(old) and not old[old_end].isspace():
+            old_end += 1
+            new_end += 1
+    return prefix, old_end, new[prefix:new_end]
+
+
 def plan(baseline: str, edits: list[EditSpec]) -> tuple[list[PlannedEdit], str]:
     if not edits:
         raise LyXMCPError("INVALID_ARGUMENT", "edits must not be empty")
@@ -77,18 +114,31 @@ def plan(baseline: str, edits: list[EditSpec]) -> tuple[list[PlannedEdit], str]:
         if spec.op == "delete":
             replacement = ""
         assert replacement is not None
+        if spec.op == "replace":
+            prefix, old_end, replacement = _narrow_replacement(target, replacement)
+            selected_start = selected.start() + prefix
+            selected_end = selected.start() + old_end
+            target = target[prefix:old_end]
+            search_occurrence = next(
+                position
+                for position, match in enumerate(re.finditer(re.escape(target), baseline, flags=re.IGNORECASE), 1)
+                if match.start() == selected_start
+            )
+        else:
+            selected_start = selected.start()
+            selected_end = selected.end()
         insertion_point = selected.end() if spec.op == "insert_after" else selected.start()
         if spec.op in ("replace", "delete"):
-            insertion_point = selected.start()
-        boundary = selected.end() if spec.op in ("replace", "delete") else insertion_point
+            insertion_point = selected_start
+        boundary = selected_end if spec.op in ("replace", "delete") else insertion_point
         if "\n" in replacement and baseline[boundary : boundary + 1] != "\n":
             raise LyXMCPError("UNSAFE_MULTILINE_EDIT", "multiline text must end at a paragraph boundary")
         planned.append(
             PlannedEdit(
                 index,
                 spec,
-                selected.start(),
-                selected.end(),
+                selected_start,
+                selected_end,
                 insertion_point,
                 search_occurrence,
                 replacement,

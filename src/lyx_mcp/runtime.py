@@ -4,8 +4,10 @@ import asyncio
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -34,6 +36,7 @@ class Runtime:
         self.layout: Layout | None = None
         self.process: subprocess.Popen[bytes] | None = None
         self.client: LyXClient | None = None
+        self._retired_roots: list[Path] = []
 
     async def start(self) -> None:
         if self.process is not None:
@@ -65,7 +68,16 @@ class Runtime:
         )
         with (layout.logs / "stdout.log").open("wb") as out, (layout.logs / "stderr.log").open("wb") as err:
             self.process = subprocess.Popen(
-                [self.config.lyx_binary, "--no-remote", "-userdir", str(layout.userdir)],
+                [
+                    sys.executable,
+                    "-m",
+                    "lyx_mcp.launch",
+                    str(os.getpid()),
+                    self.config.lyx_binary,
+                    "--no-remote",
+                    "-userdir",
+                    str(layout.userdir),
+                ],
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=err,
@@ -146,6 +158,13 @@ class Runtime:
         assert self.layout is not None
         return (self.layout.logs / "stderr.log").read_text(errors="replace")[-2000:]
 
+    async def restart(self) -> None:
+        old_layout = self.layout
+        await self.close(preserve=True)
+        if old_layout is not None:
+            self._retired_roots.append(old_layout.root)
+        await self.start()
+
     async def close(self, preserve: bool = False) -> None:
         process = self.process
         if process is not None and process.poll() is None and self.client is not None:
@@ -157,15 +176,34 @@ class Runtime:
             self.client.close()
             self.client = None
         if process is not None:
-            if process.poll() is None:
-                process.terminate()
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             deadline = time.monotonic() + 3
-            while process.poll() is None and time.monotonic() < deadline:
+            while self._group_exists(process.pid) and time.monotonic() < deadline:
+                process.poll()
                 await asyncio.sleep(0.05)
+            if self._group_exists(process.pid):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             if process.poll() is None:
-                process.kill()
                 process.wait()
             self.process = None
         if self.layout is not None and not preserve:
             shutil.rmtree(self.layout.root)
             self.layout = None
+        if not preserve:
+            for root in self._retired_roots:
+                shutil.rmtree(root)
+            self._retired_roots.clear()
+
+    @staticmethod
+    def _group_exists(pgid: int) -> bool:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        return True

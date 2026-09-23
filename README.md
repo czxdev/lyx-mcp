@@ -1,34 +1,73 @@
 # LyX MCP Server
 
-一个 stdio MCP server，对应一个独立的 offscreen LyX 进程。它通过 LyXServer FIFO 执行普通文本编辑，并在写入前建立快照；保存后的纯文本与预期结果一致，PDF 及本次 TeX 日志均通过检查，才提交这一轮修订。
+[Chinese README](README.zh-CN.md)
 
-## 安装与启动
+LyX MCP Server lets AI assistants edit LyX papers with tracked changes, including text and selected document structures, and export PDFs. It helps you review each change clearly and keep the paper ready for PDF export throughout revision.
 
-要求 Linux、LyX 2.4.x、Python 3.11+、用于 PDF 导出的 TeX 环境。默认配置只允许访问启动目录下的 `.lyx` 文件。
+## Prerequisites
+
+- **Linux** with `/proc` and `prctl(PR_SET_PDEATHSIG)`. Process cleanup and the integration tests use Linux facilities. The installed LyX/Qt build must provide the offscreen platform plugin; this server currently supports only that backend.
+- **LyX 2.4.x** installed locally. Set `[lyx].binary` to the absolute executable path. Another LyX version needs a dedicated `profile_seed_dir` and its own integration testing.
+- **Python 3.11 or newer**, `venv`, and `pip` to install the MCP server and dependencies.
+- **A working LaTeX toolchain** for `pdf2` export, including `pdflatex`, a bibliography tool such as `bibtex` for documents that use it, and the TeX packages required by the paper. Visible revisions require `xcolor.sty` and `ulem.sty`. Documents with SVG images may also need an SVG converter such as Inkscape.
+- **Writable paths:** `[lyx].runtime_root` must be writable and permit FIFOs and subprocesses. Each paper and any persistent export destination must be inside a configured `[security].allowed_roots` directory. The server user needs read access to bibliography and image assets and write access to the paper directory.
+
+Check the base installation before configuring an MCP client:
+
+```bash
+python3 --version
+lyx -version
+command -v pdflatex
+command -v bibtex
+kpsewhich xcolor.sty
+kpsewhich ulem.sty
+```
+
+A command that prints no path indicates a missing dependency needed for documents that use that feature. For an SVG-based paper, also check `command -v inkscape` or its configured converter.
+
+## Install and connect
+
+From this repository:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 cp config.example.toml config.toml
-# 修改 config.toml 中的 allowed_roots 为论文目录的绝对路径
+```
+
+For Codex, install the bundled [LyX paper editing skill](skill/lyx-paper-editing/SKILL.md) so it follows the paper editing workflow:
+
+```bash
+mkdir -p ~/.codex/skills
+cp -a skill/lyx-paper-editing ~/.codex/skills/
+```
+
+If you use a custom Codex skills directory, copy the skill there instead. Other MCP clients can use the server without the skill.
+
+Edit `config.toml`: set `binary` to the absolute LyX path, `runtime_root` to a writable directory (the default is `/tmp`), and `allowed_roots` to the **absolute directories** containing the papers and persistent exports. The placeholder `/absolute/path/to/papers` must be replaced. A paper outside these roots is rejected. `config.toml` is not tracked by Git.
+
+Configure your MCP client to start the server over **stdio**. Use the absolute path to this repository's `.venv/bin/lyx-mcp` as `command`, and set `LYX_MCP_CONFIG` to the absolute path of `config.toml` in its environment. The client launches the command when needed; a separate permanently running server is unnecessary. To run it manually, start the command below; it waits for MCP requests on stdin and can be stopped with Ctrl+C:
+
+```bash
 LYX_MCP_CONFIG="$PWD/config.toml" .venv/bin/lyx-mcp
 ```
 
-在 MCP 客户端中，将 command 设为 `.venv/bin/lyx-mcp` 的绝对路径，并设置环境变量 `LYX_MCP_CONFIG` 指向配置文件。server 只通过 stdout 传输 MCP 协议；LyX 的 stdout/stderr 写入独立 runtime 的日志。
+The server writes only MCP protocol traffic to stdout. LyX stdout and stderr go to files in the isolated runtime directory.
 
-## 工具
+## Tools
 
-| 工具 | 用途 |
+| Tool | Purpose |
 | --- | --- |
-| `lyx_get_document_state` | 查询路径、SHA256、Track Changes 和 autosave 状态 |
-| `lyx_read` | 由 LyX 导出纯文本或 LaTeX |
-| `lyx_apply_edits` | 批量 replace、delete、insert_before、insert_after；默认编译 PDF |
-| `lyx_replace_text`、`lyx_delete_text`、`lyx_insert_text` | 单项编辑的便捷接口 |
-| `lyx_export` | 导出 text、latex 或 pdf2；可复制到允许目录中的新文件 |
-| `lyx_validate_revision` | 检查 Track Changes 并编译当前文档或 master |
-| `lyx_import_revision_range` | 将另一份 `.lyx` 中已追踪的连续 Section 区间导入目标，并编译验证 |
+| `lyx_get_document_state` | Read path, SHA256, Track Changes settings, and autosave state |
+| `lyx_read` | Export accepted plain text or LaTeX through LyX |
+| `lyx_apply_edits` | Batch `replace`, `delete`, `insert_before`, and `insert_after` operations; compile by default |
+| `lyx_replace_text`, `lyx_delete_text`, `lyx_insert_text` | Single-edit convenience tools |
+| `lyx_export` | Export text, latex, or pdf2; optionally copy to a new file in an allowed directory |
+| `lyx_validate_revision` | Check Track Changes and compile the current document or its master |
+| `lyx_import_revision_range` | Import a tracked, continuous Section range from another `.lyx` file and compile |
+| `lyx_normalize_revisions` | Merge fragmented revisions from a given author and timestamp, handle unsafe `resizebox` ERT replacements, and compile |
 
-批量编辑示例：
+Example batch edit:
 
 ```json
 {
@@ -49,21 +88,25 @@ LYX_MCP_CONFIG="$PWD/config.toml" .venv/bin/lyx-mcp
 }
 ```
 
-默认要求每个目标在 LyX 导出的纯文本中精确且唯一，并能映射到 LyX 源文件中连续的普通文字。多个目标可用 `context_before`、`context_after` 消歧，再用 `occurrence` 指定匹配项。跨公式或其他 inset 的目标会在修改前被拒绝，避免 LyX 搜索超时；带公式、引用和结构的既有修订可用 `lyx_import_revision_range` 导入。插入文本中的 `\n` 表示段落分隔，且只支持在段落边界处插入。
+Each target normally must be an exact, unique match in LyX's accepted plain-text export and map to continuous ordinary text in the `.lyx` source. Use `context_before` and `context_after`, then `occurrence`, to disambiguate repeated text. Replacement narrows identical prefixes and suffixes while preserving sensible word or numeric-range boundaries. A sentence rewrite remains one contiguous revision. Targets crossing formulas or other insets are rejected before the LyX search; use `lyx_import_revision_range` for reviewed structural revisions. A `\n` in inserted text separates paragraphs and is supported only at a paragraph boundary.
 
-导入工具需要源、目标各自的 SHA256，以及相同且唯一的起止 Section 标题。它复制起始 Section 到结束 Section 之前的 LyX 标记，补齐修订作者，保留目标区间外的内容，并在独立 LyX 缓冲区重新打开、保存和编译。源区间必须已有 Track Changes 标记，目标区间不能已有修订标记。该工具会替换目标区间内的内容，不做三方合并；使用前应检查两份文档在此区间的差异。
+Import requires source and target SHA256 values and identical, unique start and end Section headings. It copies the LyX markup from the start Section up to the end Section, adds the revision author, then reopens, saves, and compiles the result in isolated LyX. The source range must already contain Track Changes markers and the target range must have none. The entire target range is replaced, without a three-way merge, so compare the full range first.
 
-`checker_profile` 只能引用配置中的固定命令。`master_path` 可用于编辑 child 文档后编译 master；目前尚未用真实多文件论文完成集成验证。`lyx_export` 的默认产物位于临时 runtime，server 退出后会删除；需要保留时传入 `output_path`，目标必须在 `allowed_roots` 中且尚不存在。
+Successful edits and imports set `\tracking_changes true` and `\output_changes true`. Compilation checks both fatal TeX errors and undefined citations in the final log. `lyx_normalize_revisions` joins adjacent edits by the same author and timestamp into readable phrases or sentences while preserving the accepted and rejected text. It accepts unsafe `resizebox` ERT opening replacements as structural formatting changes and reports their count. The [LyX paper editing skill](skill/lyx-paper-editing/SKILL.md) gives revision-span guidance and lists tested LyX syntax. In ordinary LyX text and captions, use `10-50` for a numeric range; `10--50` is raw TeX input syntax and should not be copied into LyX prose.
 
-## 隔离与冲突边界
+`checker_profile` can select only a fixed command from the configuration. `master_path` can compile a master after a child edit; real multi-file integration remains unverified. Default `lyx_export` artifacts reside in the temporary runtime and are deleted when the server exits. To keep one, pass a new `output_path` within `allowed_roots`.
 
-每个 server 启动时创建权限为 `0700` 的 runtime 和 userdir，设置独立的 `\serverpipe "$$UserDir/run/lyxserver"`，并以 `lyx --no-remote -userdir ...` 启动 `QT_QPA_PLATFORM=offscreen` 进程。server 内只维持一个 LyXServer client ID，所有工具共享一把异步锁。
+## Process isolation and cleanup
 
-桌面 LyX 可以同时运行。两个实例若同时编辑**同一文件**，桌面 LyX 中尚未保存、尚未 autosave 的内容无法被此 server 检测。请先保存并关闭该文件的桌面编辑会话。server 会拒绝更新的 `#file.lyx#` autosave、已知磁盘 SHA 变化以及事务内的外部改动。
+Each server launch creates a private `0700` runtime and userdir, configures a separate `\serverpipe "$$UserDir/run/lyxserver"`, and starts `lyx --no-remote -userdir ...` with `QT_QPA_PLATFORM=offscreen`. Tools share a single LyXServer client ID and an asynchronous lock. Desktop LyX instances are not reused or signaled.
 
-默认 profile 仅为本机 LyX 2.4.x 验证。其他版本需显式设置独立的 `profile_seed_dir`，并重新运行真实 LyX 集成测试。当前版本只实现 offscreen backend；若系统需要 Xvfb，应先补上并验证该启动路径。
+On a normal shutdown, the server asks LyX to quit, sends SIGTERM to its **own** process group, and sends SIGKILL after a three-second grace period if that group remains. On Linux, the LyX launcher also sets a parent-death signal before executing LyX, so an abruptly killed MCP server does not leave its LyX child running. A previous version only attempted cleanup from the normal shutdown path and could leave an orphan if the MCP process died first. A CPU-heavy LyX process that ignores SIGTERM therefore triggers the SIGKILL fallback; its underlying busy-loop cause cannot be diagnosed without that process's log or stack trace. The server never signals unrelated desktop LyX processes.
 
-## 测试
+Two instances can edit different files concurrently. If a desktop instance edits the **same file**, its unsaved, un-autosaved changes cannot be detected by this server; save and close that desktop buffer first. The server rejects a newer `#file.lyx#` autosave, a known disk SHA change, and external edits during a transaction.
+
+The built-in profile is verified for local LyX 2.4.x. For another version, configure an independent `profile_seed_dir` and rerun real LyX integration tests. Systems that require Xvfb need an implemented and verified launcher for that backend.
+
+## Tests
 
 ```bash
 PYTHONPATH=src .venv/bin/mypy src
@@ -71,8 +114,8 @@ PYTHONPATH=src .venv/bin/mypy src
 PYTHONPATH=src .venv/bin/pytest -q
 ```
 
-默认测试会启动两个独立的本机 LyX 实例，使用临时 `.lyx` 副本验证 Track Changes、PDF、文本编辑与失败回滚。stdio MCP 端到端测试需允许本地 IPC：
+The default suite starts isolated local LyX processes and uses temporary `.lyx` copies to test revisions, PDF export, text edits, rollback, and process cleanup. The stdio MCP and LyX syntax tests need local IPC access:
 
 ```bash
-LYX_MCP_RUN_STDIO_TEST=1 PYTHONPATH=src .venv/bin/pytest -q tests/test_stdio.py
+LYX_MCP_RUN_STDIO_TEST=1 PYTHONPATH=src .venv/bin/pytest -q tests/test_stdio.py tests/test_lyx_syntax.py
 ```

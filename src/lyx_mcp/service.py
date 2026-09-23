@@ -24,10 +24,21 @@ from .document import (
 )
 from .edit import EditSpec, apply, plan, validate_source_spans
 from .errors import ConflictError, LyXMCPError
+from .revision import normalize_revision_markup
 from .runtime import Layout, Runtime
 
 ExportFormat = Literal["text", "latex", "pdf2"]
 SUFFIX = {"text": ".txt", "latex": ".tex", "pdf2": ".pdf"}
+
+
+def _raise_fresh_pdf_errors(temp: Path, started: int) -> None:
+    for log in temp.rglob("*.log"):
+        if log.stat().st_mtime_ns < started:
+            continue
+        content = log.read_text(errors="replace")
+        errors = [line for line in content.splitlines() if line.startswith("!")]
+        if errors or "Fatal error occurred" in content:
+            raise LyXMCPError("PDF_COMPILE_FAILED", "; ".join(errors[:5]) or "fatal TeX error")
 
 
 def _pdf_has_clean_log(output: Path, temp: Path, started: int) -> bool:
@@ -42,9 +53,9 @@ def _pdf_has_clean_log(output: Path, temp: Path, started: int) -> bool:
         if not log.exists() or log.stat().st_mtime_ns < started:
             continue
         content = log.read_text(errors="replace")
-        errors = [line for line in content.splitlines() if line.startswith("!")]
-        if errors or "Fatal error occurred" in content:
-            raise LyXMCPError("PDF_COMPILE_FAILED", "; ".join(errors[:5]) or "fatal TeX error")
+        citations = re.findall(r"LaTeX Warning: Citation `([^']+)'[^\n]*undefined", content)
+        if citations:
+            raise LyXMCPError("UNDEFINED_CITATIONS", ", ".join(sorted(set(citations))))
         if "Output written on" in content:
             return True
     return False
@@ -113,6 +124,13 @@ class LyXService:
         while time.monotonic() < deadline:
             if self.runtime.process is None or self.runtime.process.poll() is not None:
                 raise LyXMCPError("LYX_EXITED", "LyX exited during export")
+            if format == "pdf2":
+                try:
+                    _raise_fresh_pdf_errors(self.layout.temp, started)
+                except LyXMCPError:
+                    await self.runtime.restart()
+                    self._opened.clear()
+                    raise
             if output.exists():
                 details = output.stat()
                 if details.st_size > 0 and details.st_mtime_ns >= started:
@@ -203,6 +221,14 @@ class LyXService:
             raise LyXMCPError("CHECKER_FAILED", f"checker {profile}: {result['output']}")
         return result
 
+    async def _enable_revision_output(self, path: Path) -> None:
+        await self._ensure_buffer(path)
+        if not header(path).output_changes:
+            await self.client.call("changes-output")
+        await self.client.call("buffer-write", "force")
+        if not header(path).output_changes:
+            raise LyXMCPError("OUTPUT_CHANGES_DISABLED", "LyX failed to enable changes in output")
+
     async def validate_revision(
         self, path: str, master_path: str | None = None, checker_profile: str | None = None
     ) -> dict[str, object]:
@@ -216,6 +242,8 @@ class LyXService:
             state = header(target)
             if not state.tracking_changes:
                 raise LyXMCPError("TRACKING_DISABLED", "Track Changes is disabled")
+            if not state.output_changes:
+                raise LyXMCPError("OUTPUT_CHANGES_DISABLED", "Show changes in output is disabled")
             pdf = await self._export(master, "pdf2")
             checker = await self._run_checker(checker_profile, target, master) if checker_profile else None
             self._known[target] = fingerprint(target)
@@ -255,6 +283,7 @@ class LyXService:
             validate_source_spans(target.read_text(errors="replace"), baseline, ordered)
             saved = snapshot(target, self.layout.snapshots)
             initial_header = header(target)
+            citation_count = target.read_bytes().count(b"\\begin_inset CommandInset citation")
             expected_disk = before
             stage = "tracking"
             try:
@@ -264,6 +293,9 @@ class LyXService:
                     if not header(target).tracking_changes:
                         raise LyXMCPError("TRACKING_DISABLED", "LyX failed to enable Track Changes")
                     expected_disk = fingerprint(target)
+                stage = "revision_output"
+                await self._enable_revision_output(target)
+                expected_disk = fingerprint(target)
                 stage = "edit"
                 await self._ensure_buffer(target)
                 await apply(self.client, ordered)
@@ -274,8 +306,10 @@ class LyXService:
                 expected_disk = fingerprint(target)
                 if not header(target).tracking_changes:
                     raise LyXMCPError("TRACKING_DISABLED", "Track Changes was disabled after edit")
-                if header(target).output_changes != initial_header.output_changes:
-                    raise LyXMCPError("OUTPUT_CHANGES_MODIFIED", "LyX changed output_changes")
+                if not header(target).output_changes:
+                    raise LyXMCPError("OUTPUT_CHANGES_DISABLED", "LyX disabled changes in output")
+                if target.read_bytes().count(b"\\begin_inset CommandInset citation") != citation_count:
+                    raise LyXMCPError("CITATION_CHANGED", "plain-text editing changed citation insets")
                 stage = "postcondition"
                 actual_file = await self._export(target, "text")
                 actual = actual_file.read_text(errors="replace")
@@ -297,6 +331,7 @@ class LyXService:
                     "sha256_before": before,
                     "sha256_after": after,
                     "tracking_changes": True,
+                    "output_changes": True,
                     "edits": [{"index": edit.index, "search_occurrence": edit.search_occurrence} for edit in ordered],
                     "pdf": str(pdf) if pdf else None,
                     "checker": checker,
@@ -313,8 +348,10 @@ class LyXService:
                         assert_unchanged(target, expected_disk)
                         restore(target, saved)
                         rolled_back = True
+                    buffer_was_open = target in self._opened
                     await self._ensure_buffer(target)
-                    await self.client.call("buffer-reload", "dump")
+                    if buffer_was_open:
+                        await self.client.call("buffer-reload", "dump")
                     rollback_verified = rolled_back and fingerprint(target) == before
                     if rolled_back:
                         self._known[target] = before
@@ -372,8 +409,11 @@ class LyXService:
                     await self.client.call("changes-track")
                     await self.client.call("buffer-write", "force")
                     expected_disk = fingerprint(target)
+                stage = "revision_output"
+                await self._enable_revision_output(target)
+                expected_disk = fingerprint(target)
                 state = header(target)
-                if not state.tracking_changes or state.output_changes != initial_header.output_changes:
+                if not state.tracking_changes or not state.output_changes:
                     raise LyXMCPError("HEADER_CHANGED", "LyX did not preserve revision settings")
                 written = target.read_bytes()
                 start, end = section_span(written, start_heading, end_heading)
@@ -391,6 +431,7 @@ class LyXService:
                     "sha256_after": after,
                     "imported_change_markers": changes,
                     "tracking_changes": True,
+                    "output_changes": True,
                     "pdf": str(pdf) if pdf else None,
                     "rolled_back": False,
                 }
@@ -419,5 +460,82 @@ class LyXService:
                     "diagnostic": str(exc),
                     "rolled_back": rolled_back,
                     "rollback_verified": rollback_verified,
+                    "rollback_error": rollback_error,
+                }
+
+    async def normalize_revisions(
+        self, path: str, expected_sha256: str, author_id: int, timestamp: int, compile: bool = True
+    ) -> dict[str, object]:
+        async with self.lock:
+            target = authorize(path, self.config.allowed_roots)
+            reject_newer_autosave(target)
+            assert_unchanged(target, expected_sha256)
+            if target in self._known:
+                assert_unchanged(target, self._known[target])
+            original = target.read_bytes()
+            normalized, merged_groups, accepted_ert = normalize_revision_markup(original, author_id, timestamp)
+            if not merged_groups and not accepted_ert:
+                raise LyXMCPError("NO_MARKUP_TO_NORMALIZE", "no matching revisions need normalization")
+            await self._ensure_buffer(target)
+            baseline = (await self._export(target, "text")).read_text(errors="replace")
+            saved = snapshot(target, self.layout.snapshots)
+            expected_disk = expected_sha256
+            stage = "normalize"
+            try:
+                await self.client.call("buffer-close")
+                self._opened.discard(target)
+                write_bytes_atomically(target, normalized)
+                expected_disk = fingerprint(target)
+                await self._ensure_buffer(target)
+                await self._enable_revision_output(target)
+                expected_disk = fingerprint(target)
+                if not header(target).tracking_changes:
+                    raise LyXMCPError("TRACKING_DISABLED", "Track Changes was disabled")
+                if target.read_bytes().count(b"\\begin_inset CommandInset citation") != original.count(
+                    b"\\begin_inset CommandInset citation"
+                ):
+                    raise LyXMCPError("CITATION_CHANGED", "citation inset count changed")
+                stage = "postcondition"
+                actual = (await self._export(target, "text")).read_text(errors="replace")
+                if actual != baseline:
+                    raise LyXMCPError("POSTCONDITION_FAILED", "accepted text changed during normalization")
+                stage = "compile"
+                pdf = await self._export(target, "pdf2") if compile else None
+                after = fingerprint(target)
+                self._known[target] = after
+                return {
+                    "ok": True,
+                    "path": str(target),
+                    "sha256_before": expected_sha256,
+                    "sha256_after": after,
+                    "merged_groups": merged_groups,
+                    "accepted_structural_ert_replacements": accepted_ert,
+                    "output_changes": True,
+                    "pdf": str(pdf) if pdf else None,
+                    "rolled_back": False,
+                }
+            except (LyXMCPError, OSError) as exc:
+                rollback_error = None
+                rolled_back = False
+                try:
+                    assert_unchanged(target, expected_disk)
+                    if target in self._opened:
+                        await self._ensure_buffer(target)
+                        await self.client.call("buffer-close")
+                        self._opened.discard(target)
+                    restore(target, saved)
+                    rolled_back = True
+                    await self._ensure_buffer(target)
+                    self._known[target] = expected_sha256
+                except (LyXMCPError, OSError) as failed:
+                    rollback_error = str(failed)
+                    await self.runtime.close(preserve=True)
+                return {
+                    "ok": False,
+                    "stage": stage,
+                    "error_code": exc.code if isinstance(exc, LyXMCPError) else type(exc).__name__,
+                    "diagnostic": str(exc),
+                    "rolled_back": rolled_back,
+                    "rollback_verified": rolled_back and fingerprint(target) == expected_sha256,
                     "rollback_error": rollback_error,
                 }

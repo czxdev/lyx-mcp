@@ -15,6 +15,7 @@ from lyx_mcp.document import (
 from lyx_mcp.edit import EditSpec, plan, validate_source_spans
 from lyx_mcp.errors import ConflictError, LyXMCPError
 from lyx_mcp.protocol import command, parse
+from lyx_mcp.revision import normalize_revision_markup
 
 FIXTURE = Path(__file__).parent / "fixtures" / "simple.lyx"
 
@@ -57,6 +58,49 @@ def test_multiline_requires_paragraph_boundary() -> None:
         plan("Alpha beta. Gamma.\n\n", [EditSpec(op="insert_after", anchor="Alpha", text="A\nB")])
     _, expected = plan("Alpha beta.\n\n", [EditSpec(op="insert_after", anchor="Alpha beta.", text="\nMore")])
     assert expected == "Alpha beta.\n\nMore\n\n"
+
+
+def test_replacement_granularity_matches_the_real_change() -> None:
+    sentence = "The method achieve better results."
+    edits, expected = plan(
+        sentence,
+        [EditSpec(op="replace", old_text=sentence, new_text="The method achieves better results.")],
+    )
+    assert edits[0].target == "achieve"
+    assert edits[0].replacement == "achieves"
+    assert expected == "The method achieves better results."
+    rewritten, _ = plan(
+        sentence,
+        [EditSpec(op="replace", old_text=sentence, new_text="Our revised method performs well in the experiments.")],
+    )
+    assert rewritten[0].target == sentence[:-1]
+    with pytest.raises(LyXMCPError, match="identical"):
+        plan(sentence, [EditSpec(op="replace", old_text=sentence, new_text=sentence)])
+    dash, _ = plan("Delays of 10--50 rounds.", [EditSpec(op="replace", old_text="10--50", new_text="10-50")])
+    assert dash[0].target == "10--50"
+    assert dash[0].replacement == "10-50"
+
+
+def test_normalize_fragmented_text_and_unsafe_ert() -> None:
+    source = (
+        b"\\change_deleted 0 100\nWe\n\\change_inserted 0 100\nThey\n\\change_unchanged\n \n"
+        b"\\change_deleted 0 100\nuse\n\\change_inserted 0 100\ntest\n\\change_unchanged\n \n"
+        b"\\change_deleted 0 100\nwords\n\\change_inserted 0 100\nphrases\n\\change_unchanged\n"
+        b"\\change_deleted 0 100\n\\begin_inset ERT\nstatus open\n"
+        b"\\begin_layout Plain Layout\n\\backslash\nresizebox{0.5\\backslash\ntextwidth}{!}{\n"
+        b"\\end_layout\n\\end_inset\n"
+        b"\\change_inserted 0 100\n\\begin_inset ERT\nstatus collapsed\n"
+        b"\\begin_layout Plain Layout\n\\backslash\nresizebox{\\backslash\ncolumnwidth}{!}{\n"
+        b"\\end_layout\n\\end_inset\n\\change_unchanged\n"
+    )
+    normalized, groups, accepted = normalize_revision_markup(source, 0, 100)
+    assert groups == 1
+    assert accepted == 1
+    assert normalized.count(b"\\change_deleted") == 1
+    assert b"We\n \nuse\n \nwords" in normalized
+    assert b"They\n \ntest\n \nphrases" in normalized
+    assert b"resizebox{0.5" not in normalized
+    assert b"resizebox{\\backslash\ncolumnwidth}" in normalized
 
 
 def test_formula_spanning_text_is_rejected_before_edit() -> None:

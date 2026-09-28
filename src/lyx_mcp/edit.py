@@ -85,6 +85,36 @@ def _narrow_replacement(old: str, new: str) -> tuple[int, int, str]:
     return prefix, old_end, new[prefix:new_end]
 
 
+def locate_target(
+    baseline: str,
+    target: str,
+    occurrence: int = 1,
+    require_unique: bool = True,
+    context_before: str | None = None,
+    context_after: str | None = None,
+    index: int = 0,
+) -> tuple[int, int, int]:
+    matches = list(re.finditer(re.escape(target), baseline, flags=re.IGNORECASE))
+    exact = [
+        match
+        for match in matches
+        if match.group() == target
+        and (context_before is None or baseline[: match.start()].endswith(context_before))
+        and (context_after is None or baseline[match.end() :].startswith(context_after))
+    ]
+    if not exact:
+        raise LyXMCPError("TARGET_NOT_FOUND", f"edit {index}: target not found")
+    if require_unique and len(exact) != 1:
+        raise LyXMCPError("AMBIGUOUS_TARGET", f"edit {index}: {len(exact)} matches")
+    if occurrence > len(exact):
+        raise LyXMCPError("TARGET_NOT_FOUND", f"edit {index}: occurrence exceeds match count")
+    selected = exact[occurrence - 1]
+    search_occurrence = next(
+        position for position, match in enumerate(matches, 1) if match.start() == selected.start()
+    )
+    return selected.start(), selected.end(), search_occurrence
+
+
 def plan(baseline: str, edits: list[EditSpec]) -> tuple[list[PlannedEdit], str]:
     if not edits:
         raise LyXMCPError("INVALID_ARGUMENT", "edits must not be empty")
@@ -92,23 +122,14 @@ def plan(baseline: str, edits: list[EditSpec]) -> tuple[list[PlannedEdit], str]:
     for index, spec in enumerate(edits):
         target = spec.anchor if spec.op.startswith("insert_") else spec.old_text
         assert target is not None
-        matches = list(re.finditer(re.escape(target), baseline, flags=re.IGNORECASE))
-        exact = [
-            match
-            for match in matches
-            if match.group() == target
-            and (spec.context_before is None or baseline[: match.start()].endswith(spec.context_before))
-            and (spec.context_after is None or baseline[match.end() :].startswith(spec.context_after))
-        ]
-        if not exact:
-            raise LyXMCPError("TARGET_NOT_FOUND", f"edit {index}: target not found")
-        if spec.require_unique and len(exact) != 1:
-            raise LyXMCPError("AMBIGUOUS_TARGET", f"edit {index}: {len(exact)} matches")
-        if spec.occurrence > len(exact):
-            raise LyXMCPError("TARGET_NOT_FOUND", f"edit {index}: occurrence exceeds match count")
-        selected = exact[spec.occurrence - 1]
-        search_occurrence = next(
-            position for position, match in enumerate(matches, 1) if match.start() == selected.start()
+        selected_start, selected_end, search_occurrence = locate_target(
+            baseline,
+            target,
+            spec.occurrence,
+            spec.require_unique,
+            spec.context_before,
+            spec.context_after,
+            index,
         )
         replacement = spec.text if spec.op.startswith("insert_") else spec.new_text
         if spec.op == "delete":
@@ -116,18 +137,16 @@ def plan(baseline: str, edits: list[EditSpec]) -> tuple[list[PlannedEdit], str]:
         assert replacement is not None
         if spec.op == "replace":
             prefix, old_end, replacement = _narrow_replacement(target, replacement)
-            selected_start = selected.start() + prefix
-            selected_end = selected.start() + old_end
+            original_start = selected_start
+            selected_start = original_start + prefix
+            selected_end = original_start + old_end
             target = target[prefix:old_end]
             search_occurrence = next(
                 position
                 for position, match in enumerate(re.finditer(re.escape(target), baseline, flags=re.IGNORECASE), 1)
                 if match.start() == selected_start
             )
-        else:
-            selected_start = selected.start()
-            selected_end = selected.end()
-        insertion_point = selected.end() if spec.op == "insert_after" else selected.start()
+        insertion_point = selected_end if spec.op == "insert_after" else selected_start
         if spec.op in ("replace", "delete"):
             insertion_point = selected_start
         boundary = selected_end if spec.op in ("replace", "delete") else insertion_point
@@ -159,15 +178,18 @@ def plan(baseline: str, edits: list[EditSpec]) -> tuple[list[PlannedEdit], str]:
     return ordered, expected
 
 
-def validate_source_spans(source: str, baseline: str, edits: list[PlannedEdit]) -> None:
+def validate_source_span(source: str, baseline: str, target: str, index: int = 0) -> None:
     flattened = source.replace("\r", "").replace("\n", "")
+    if flattened.count(target) != baseline.count(target):
+        raise LyXMCPError(
+            "UNSUPPORTED_SPAN",
+            f"edit {index}: target cannot be mapped uniquely to contiguous plain text in the LyX source",
+        )
+
+
+def validate_source_spans(source: str, baseline: str, edits: list[PlannedEdit]) -> None:
     for item in edits:
-        target = item.target
-        if flattened.count(target) != baseline.count(target):
-            raise LyXMCPError(
-                "UNSUPPORTED_SPAN",
-                f"edit {item.index}: target cannot be mapped uniquely to contiguous plain text in the LyX source",
-            )
+        validate_source_span(source, baseline, item.target, item.index)
 
 
 async def _insert(client: LyXClient, text: str) -> None:

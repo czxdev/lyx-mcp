@@ -62,6 +62,7 @@ The server writes only MCP protocol traffic to stdout. LyX stdout and stderr go 
 | `lyx_read` | Export accepted plain text or LaTeX through LyX |
 | `lyx_apply_edits` | Batch `replace`, `delete`, `insert_before`, and `insert_after` operations; compile by default |
 | `lyx_replace_text`, `lyx_delete_text`, `lyx_insert_text` | Single-edit convenience tools |
+| `lyx_insert_citation` | Insert a citation before or after a plain-text anchor, merging with an adjacent citation when LyX does; compile by default |
 | `lyx_export` | Export text, latex, or pdf2; optionally copy to a new file in an allowed directory |
 | `lyx_validate_revision` | Check Track Changes and compile the current document or its master |
 | `lyx_import_revision_range` | Import a tracked, continuous Section range from another `.lyx` file and compile |
@@ -88,7 +89,9 @@ Example batch edit:
 }
 ```
 
-Each target normally must be an exact, unique match in LyX's accepted plain-text export and map to continuous ordinary text in the `.lyx` source. Use `context_before` and `context_after`, then `occurrence`, to disambiguate repeated text. Replacement narrows identical prefixes and suffixes while preserving sensible word or numeric-range boundaries. A sentence rewrite remains one contiguous revision. Targets crossing formulas or other insets are rejected before the LyX search; use `lyx_import_revision_range` for reviewed structural revisions. A `\n` in inserted text separates paragraphs and is supported only at a paragraph boundary.
+Each target normally must be an exact, unique match in LyX's accepted plain-text export and map to continuous ordinary text in the `.lyx` source. Use `context_before` and `context_after`, then `occurrence`, to disambiguate repeated text. Replacement narrows identical prefixes and suffixes while preserving sensible word or numeric-range boundaries. A sentence rewrite remains one contiguous revision. Targets crossing formulas or other insets are rejected before the LyX search. Use `lyx_insert_citation` to add a citation by bibliography key and `lyx_import_revision_range` to import a reviewed structural revision, including an existing citation inset. A `\n` in inserted text separates paragraphs and is supported only at a paragraph boundary.
+
+`lyx_insert_citation` takes `path`, `anchor`, and comma-separated `keys`. It inserts after the anchor by default; set `position="before"` to insert before it. A separate new inset is tracked, while LyX may merge keys into an adjacent citation and report `merged_into_existing=true`. The PDF is compiled by default; undefined keys cause rollback. Add any needed space with an ordinary text edit.
 
 Import requires source and target SHA256 values and identical, unique start and end Section headings. It copies the LyX markup from the start Section up to the end Section, adds the revision author, then reopens, saves, and compiles the result in isolated LyX. The source range must already contain Track Changes markers and the target range must have none. The entire target range is replaced, without a three-way merge, so compare the full range first.
 

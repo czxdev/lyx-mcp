@@ -18,7 +18,10 @@ pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux process s
 
 def _live(pid: int) -> bool:
     status = Path(f"/proc/{pid}/stat")
-    return status.exists() and status.read_text().split(") ", 1)[1][0] != "Z"
+    try:
+        return status.read_text().split(") ", 1)[1][0] != "Z"
+    except FileNotFoundError:
+        return False
 
 
 def test_lyx_launcher_dies_when_mcp_parent_is_killed() -> None:

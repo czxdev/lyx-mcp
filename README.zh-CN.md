@@ -49,6 +49,7 @@ cp -a skill/lyx-paper-editing ~/.codex/skills/
 | `lyx_read` | 由 LyX 导出纯文本或 LaTeX |
 | `lyx_apply_edits` | 批量 replace、delete、insert_before、insert_after；默认编译 PDF |
 | `lyx_replace_text`、`lyx_delete_text`、`lyx_insert_text` | 单项编辑的便捷接口 |
+| `lyx_insert_citation` | 在普通正文锚点前后插入引用；与已有引用相邻时允许 LyX 合并，默认编译 PDF |
 | `lyx_export` | 导出 text、latex 或 pdf2；可复制到允许目录中的新文件 |
 | `lyx_validate_revision` | 检查 Track Changes 并编译当前文档或 master |
 | `lyx_import_revision_range` | 将另一份 `.lyx` 中已追踪的连续 Section 区间导入目标，并编译验证 |
@@ -75,7 +76,9 @@ cp -a skill/lyx-paper-editing ~/.codex/skills/
 }
 ```
 
-默认要求每个目标在 LyX 导出的纯文本中精确且唯一，并能映射到 LyX 源文件中连续的普通文字。多个目标可用 `context_before`、`context_after` 消歧，再用 `occurrence` 指定匹配项。替换操作自动收缩相同的前后文字，同时保持整词边界；句子整体重写仍作为一个连续修订。跨公式或其他 inset 的目标会在修改前被拒绝，避免 LyX 搜索超时；带公式、引用和结构的既有修订可用 `lyx_import_revision_range` 导入。插入文本中的 `\n` 表示段落分隔，且只支持在段落边界处插入。
+默认要求每个目标在 LyX 导出的纯文本中精确且唯一，并能映射到 LyX 源文件中连续的普通文字。多个目标可用 `context_before`、`context_after` 消歧，再用 `occurrence` 指定匹配项。替换操作自动收缩相同的前后文字，同时保持整词边界；句子整体重写仍作为一个连续修订。跨公式或其他 inset 的目标会在修改前被拒绝，避免 LyX 搜索超时。按文献 key 新增引用时使用 `lyx_insert_citation`；导入另一文档中已经审阅的公式、引用或其他结构性修订时使用 `lyx_import_revision_range`。插入文本中的 `\n` 表示段落分隔，且只支持在段落边界处插入。
+
+`lyx_insert_citation` 接收 `path`、`anchor` 和 `keys`，默认在锚点后插入；多个 key 用逗号分隔，`position="before"` 可改为锚点前。独立插入的引用 inset 带修订记录；LyX 将 key 合并到紧邻的已有引用时也视为成功，并返回 `merged_into_existing=true`。默认编译 PDF，文献库中不存在的 key 会导致回滚；需要空格时另作普通文本编辑。
 
 导入工具需要源、目标各自的 SHA256，以及相同且唯一的起止 Section 标题。它复制起始 Section 到结束 Section 之前的 LyX 标记，补齐修订作者，保留目标区间外的内容，并在独立 LyX 缓冲区重新打开、保存和编译。源区间必须已有 Track Changes 标记，目标区间不能已有修订标记。该工具会替换目标区间内的内容，不做三方合并；使用前应检查两份文档在此区间的差异。
 

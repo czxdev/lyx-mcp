@@ -22,7 +22,7 @@ from .document import (
     snapshot,
     write_bytes_atomically,
 )
-from .edit import EditSpec, apply, plan, validate_source_spans
+from .edit import EditSpec, apply, locate_target, plan, validate_source_span, validate_source_spans
 from .errors import ConflictError, LyXMCPError
 from .revision import normalize_revision_markup
 from .runtime import Layout, Runtime
@@ -59,6 +59,23 @@ def _pdf_has_clean_log(output: Path, temp: Path, started: int) -> bool:
         if "Output written on" in content:
             return True
     return False
+
+
+def _tracked_citation_count(source: bytes, keys: str) -> int:
+    pattern = rb'(?m)^\\begin_inset CommandInset citation\r?\nLatexCommand [^\r\n]+\r?\nkey "' + re.escape(
+        keys.encode()
+    ) + rb'"'
+    count = 0
+    for match in re.finditer(pattern, source):
+        marker = source.rfind(b"\\change_", 0, match.start())
+        if marker >= 0 and source[marker:].startswith(b"\\change_inserted "):
+            count += 1
+    return count
+
+
+def _citation_key_lists(source: bytes) -> list[tuple[str, ...]]:
+    pattern = rb'(?m)^\\begin_inset CommandInset citation\r?\nLatexCommand [^\r\n]+\r?\nkey "([^"]+)"'
+    return [tuple(value.decode().split(",")) for value in re.findall(pattern, source)]
 
 
 class LyXService:
@@ -257,6 +274,35 @@ class LyXService:
                 "checker": checker,
             }
 
+    async def _rollback_buffer_edit(
+        self, target: Path, saved: Path, before: str, expected_disk: str, exc: LyXMCPError | OSError
+    ) -> dict[str, object]:
+        rolled_back = False
+        rollback_verified = False
+        rollback_error = None
+        try:
+            if isinstance(exc, ConflictError):
+                self._conflicted.add(target)
+            else:
+                assert_unchanged(target, expected_disk)
+                restore(target, saved)
+                rolled_back = True
+            buffer_was_open = target in self._opened
+            await self._ensure_buffer(target)
+            if buffer_was_open:
+                await self.client.call("buffer-reload", "dump")
+            rollback_verified = rolled_back and fingerprint(target) == before
+            if rolled_back:
+                self._known[target] = before
+        except (LyXMCPError, OSError) as failed:
+            rollback_error = str(failed)
+            await self.runtime.close(preserve=True)
+        return {
+            "rolled_back": rolled_back,
+            "rollback_verified": rollback_verified,
+            "rollback_error": rollback_error,
+        }
+
     async def apply_edits(
         self,
         path: str,
@@ -338,34 +384,154 @@ class LyXService:
                     "rolled_back": False,
                 }
             except (LyXMCPError, OSError) as exc:
-                rolled_back = False
-                rollback_verified = False
-                rollback_error = None
-                try:
-                    if isinstance(exc, ConflictError):
-                        self._conflicted.add(target)
-                    else:
-                        assert_unchanged(target, expected_disk)
-                        restore(target, saved)
-                        rolled_back = True
-                    buffer_was_open = target in self._opened
-                    await self._ensure_buffer(target)
-                    if buffer_was_open:
-                        await self.client.call("buffer-reload", "dump")
-                    rollback_verified = rolled_back and fingerprint(target) == before
-                    if rolled_back:
-                        self._known[target] = before
-                except (LyXMCPError, OSError) as failed:
-                    rollback_error = str(failed)
-                    await self.runtime.close(preserve=True)
                 return {
                     "ok": False,
                     "stage": stage,
                     "error_code": exc.code if isinstance(exc, LyXMCPError) else type(exc).__name__,
                     "diagnostic": str(exc),
-                    "rolled_back": rolled_back,
-                    "rollback_verified": rollback_verified,
-                    "rollback_error": rollback_error,
+                    **await self._rollback_buffer_edit(target, saved, before, expected_disk, exc),
+                }
+
+    async def insert_citation(
+        self,
+        path: str,
+        anchor: str,
+        keys: str,
+        position: Literal["before", "after"] = "after",
+        occurrence: int = 1,
+        require_unique: bool = True,
+        context_before: str | None = None,
+        context_after: str | None = None,
+        master_path: str | None = None,
+        compile: bool = True,
+        checker_profile: str | None = None,
+    ) -> dict[str, object]:
+        if not anchor or len(anchor.encode()) > 2000 or any(character in anchor for character in "\r\n\x00"):
+            raise LyXMCPError("INVALID_ARGUMENT", "anchor must be nonempty single-line text of at most 2000 bytes")
+        if occurrence < 1 or position not in ("before", "after"):
+            raise LyXMCPError("INVALID_ARGUMENT", "invalid citation position or occurrence")
+        parts = [part.strip() for part in keys.split(",")]
+        if any(
+            not part
+            or any(
+                not character.isprintable() or character.isspace() or character in '"|{}\\'
+                for character in part
+            )
+            for part in parts
+        ):
+            raise LyXMCPError("INVALID_ARGUMENT", "keys must be comma-separated bibliography keys")
+        normalized_keys = ",".join(parts)
+        async with self.lock:
+            target = authorize(path, self.config.allowed_roots)
+            master = authorize(master_path, self.config.allowed_roots) if master_path else target
+            if target in self._conflicted:
+                raise ConflictError("CONFLICT_NEEDS_REVIEW", "read the document again after the external modification")
+            if checker_profile and checker_profile not in self.config.checker_profiles:
+                raise LyXMCPError("UNKNOWN_CHECKER", f"checker profile is not configured: {checker_profile}")
+            reject_newer_autosave(target)
+            before = fingerprint(target)
+            if target in self._known:
+                assert_unchanged(target, self._known[target])
+            await self._ensure_buffer(target)
+            baseline = (await self._export(target, "text")).read_text(errors="replace")
+            _, _, search_occurrence = locate_target(
+                baseline, anchor, occurrence, require_unique, context_before, context_after
+            )
+            source = target.read_bytes()
+            validate_source_span(source.decode(errors="replace"), baseline, anchor)
+            citation_count = source.count(b"\\begin_inset CommandInset citation")
+            citation_keys = _citation_key_lists(source)
+            tracked_count = _tracked_citation_count(source, normalized_keys)
+            saved = snapshot(target, self.layout.snapshots)
+            initial_header = header(target)
+            expected_disk = before
+            stage = "tracking"
+            try:
+                if not initial_header.tracking_changes:
+                    await self.client.call("changes-track")
+                    await self.client.call("buffer-write", "force")
+                    if not header(target).tracking_changes:
+                        raise LyXMCPError("TRACKING_DISABLED", "LyX failed to enable Track Changes")
+                    expected_disk = fingerprint(target)
+                stage = "revision_output"
+                await self._enable_revision_output(target)
+                expected_disk = fingerprint(target)
+                stage = "edit"
+                await self._ensure_buffer(target)
+                await self.client.call("buffer-begin")
+                for _ in range(search_occurrence):
+                    response = await self.client.call("word-find-forward", anchor)
+                    if response:
+                        raise LyXMCPError("TARGET_NOT_FOUND", f"LyX search: {response}")
+                await self.client.call("mark-off")
+                if position == "before":
+                    for _ in anchor:
+                        await self.client.call("char-backward")
+                missing_keys = await self.client.call("citation-insert", normalized_keys)
+                assert_unchanged(target, expected_disk)
+                stage = "save"
+                await self.client.call("buffer-write", "force")
+                expected_disk = fingerprint(target)
+                state = header(target)
+                if not state.tracking_changes or not state.output_changes:
+                    raise LyXMCPError("HEADER_CHANGED", "LyX did not preserve revision settings")
+                written = target.read_bytes()
+                merged_into_existing = False
+                written_count = written.count(b"\\begin_inset CommandInset citation")
+                if written_count == citation_count + 1:
+                    if _tracked_citation_count(written, normalized_keys) != tracked_count + 1:
+                        raise LyXMCPError("TRACKING_LOST", "new citation is not a tracked insertion")
+                elif written_count == citation_count:
+                    updated_keys = _citation_key_lists(written)
+                    if len(updated_keys) != len(citation_keys):
+                        raise LyXMCPError("CITATION_NOT_INSERTED", "LyX did not add a citation key")
+                    changed = [(old, new) for old, new in zip(citation_keys, updated_keys, strict=True) if old != new]
+                    if len(changed) != 1:
+                        raise LyXMCPError("CITATION_NOT_INSERTED", "LyX did not add a citation key")
+                    old, new = changed[0]
+                    expected = set(old) | set(parts)
+                    if set(new) != expected or len(new) != len(expected) or len(new) <= len(old):
+                        raise LyXMCPError("CITATION_NOT_INSERTED", "LyX did not merge the requested citation keys")
+                    merged_into_existing = True
+                else:
+                    raise LyXMCPError("CITATION_NOT_INSERTED", "LyX changed the citation inset count unexpectedly")
+                if missing_keys.strip():
+                    raise LyXMCPError("UNDEFINED_CITATIONS", missing_keys)
+                stage = "postcondition"
+                actual = (await self._export(target, "text")).read_text(errors="replace")
+                if actual.count(anchor) != baseline.count(anchor):
+                    raise LyXMCPError("POSTCONDITION_FAILED", "citation insertion changed its plain-text anchor")
+                stage = "compile"
+                if master != target:
+                    await self._refresh_if_changed(master)
+                pdf = await self._export(master, "pdf2") if compile else None
+                stage = "checker"
+                checker = await self._run_checker(checker_profile, target, master) if checker_profile else None
+                after = fingerprint(target)
+                self._known[target] = after
+                if master != target:
+                    self._known[master] = fingerprint(master)
+                return {
+                    "ok": True,
+                    "path": str(target),
+                    "sha256_before": before,
+                    "sha256_after": after,
+                    "tracking_changes": True,
+                    "output_changes": True,
+                    "keys": normalized_keys,
+                    "merged_into_existing": merged_into_existing,
+                    "search_occurrence": search_occurrence,
+                    "pdf": str(pdf) if pdf else None,
+                    "checker": checker,
+                    "rolled_back": False,
+                }
+            except (LyXMCPError, OSError) as exc:
+                return {
+                    "ok": False,
+                    "stage": stage,
+                    "error_code": exc.code if isinstance(exc, LyXMCPError) else type(exc).__name__,
+                    "diagnostic": str(exc),
+                    **await self._rollback_buffer_edit(target, saved, before, expected_disk, exc),
                 }
 
     async def import_revision_range(

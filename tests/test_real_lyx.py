@@ -1,4 +1,5 @@
 import asyncio
+import re
 import shutil
 import stat
 from pathlib import Path
@@ -12,6 +13,57 @@ from lyx_mcp.errors import ConflictError, LyXMCPError
 from lyx_mcp.service import LyXService
 
 FIXTURE = Path(__file__).parent / "fixtures" / "simple.lyx"
+
+
+@pytest.mark.skipif(shutil.which("lyx") is None, reason="LyX is not installed")
+@pytest.mark.parametrize("keys", ["A", "A,B", "MissingCitationProbe"])
+def test_native_citation_insert_in_isolated_lyx(tmp_path: Path, keys: str) -> None:
+    async def exercise() -> None:
+        (tmp_path / "refs.bib").write_text(
+            "@article{A, title={A}, author={Alpha}, journal={Test}, year={2020}}\n"
+            "@article{B, title={B}, author={Beta}, journal={Test}, year={2021}}\n"
+        )
+        bibliography = (
+            "\\begin_layout Standard\n\\begin_inset CommandInset bibtex\nLatexCommand bibtex\n"
+            'btprint "btPrintCited"\nbibfiles "refs"\noptions "plain"\nencoding "default"\n\n'
+            "\\end_inset\n\\end_layout\n"
+        )
+        document = tmp_path / "native-citation.lyx"
+        document.write_text(FIXTURE.read_text().replace("\\end_body", bibliography + "\\end_body"))
+        service = LyXService(Config(allowed_roots=(tmp_path,), export_timeout_sec=40))
+        await service.start()
+        try:
+            await service.read(str(document))
+            await service.client.call("changes-track")
+            await service.client.call("changes-output")
+            await service.client.call("buffer-begin")
+            assert await service.client.call("word-find-forward", "Gamma delta") == ""
+            await service.client.call("mark-off")
+            response = await service.client.call("citation-insert", keys)
+            await service.client.call("buffer-write", "force")
+            service._known[document] = fingerprint(document)
+            source = document.read_text()
+            assert source.count("\\begin_inset CommandInset citation") == 1
+            assert f'key "{keys}"' in source
+            assert re.search(r"\\change_inserted \d+ \d+\n\s*\\begin_inset CommandInset citation", source)
+            state = await service.get_document_state(str(document))
+            assert state["tracking_changes"] is True
+            assert state["output_changes"] is True
+            if keys == "MissingCitationProbe":
+                assert response == keys
+                with pytest.raises(LyXMCPError) as undefined:
+                    await service.validate_revision(str(document))
+                assert undefined.value.code == "UNDEFINED_CITATIONS"
+                return
+            assert response == ""
+            latex = (await service.read(str(document), "latex"))["content"]
+            assert re.search(r"Gamma delta\\lyxadded[^\n]*\\cite\{" + keys + r"\}", latex)
+            result = await service.validate_revision(str(document))
+            assert Path(result["pdf"]).read_bytes().startswith(b"%PDF-")
+        finally:
+            await service.close()
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.skipif(shutil.which("lyx") is None, reason="LyX is not installed")

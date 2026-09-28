@@ -33,6 +33,7 @@ def test_stdio_mcp_edit_and_read(tmp_path: Path) -> None:
         async with Client(server) as client:
             listed = await client.list_tools()
             assert "lyx_apply_edits" in {tool.name for tool in listed.tools}
+            assert "lyx_insert_citation" in {tool.name for tool in listed.tools}
             assert "lyx_import_revision_range" in {tool.name for tool in listed.tools}
             edited = await client.call_tool(
                 "lyx_apply_edits",

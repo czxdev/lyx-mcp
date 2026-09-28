@@ -97,6 +97,37 @@ async def lyx_insert_text(
 
 
 @mcp.tool()
+async def lyx_insert_citation(
+    path: str,
+    anchor: str,
+    keys: str,
+    ctx: Context[AppContext],
+    position: Literal["before", "after"] = "after",
+    occurrence: int = 1,
+    require_unique: bool = True,
+    context_before: str | None = None,
+    context_after: str | None = None,
+    master_path: str | None = None,
+    compile: bool = True,
+    checker_profile: str | None = None,
+) -> dict[str, object]:
+    """Insert a tracked citation inset at a plain-text anchor and validate the document."""
+    return await ctx.request_context.lifespan_context.service.insert_citation(
+        path,
+        anchor,
+        keys,
+        position,
+        occurrence,
+        require_unique,
+        context_before,
+        context_after,
+        master_path,
+        compile,
+        checker_profile,
+    )
+
+
+@mcp.tool()
 async def lyx_export(
     path: str,
     format: Literal["text", "latex", "pdf2"],

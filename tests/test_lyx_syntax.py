@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -73,6 +74,122 @@ def test_plain_text_layout_syntax_via_mcp(tmp_path: Path, layout: str) -> None:
 
 def _citation(key: str) -> str:
     return f'\\begin_inset CommandInset citation\nLatexCommand cite\nkey "{key}"\nliteral "false"\n\n\\end_inset'
+
+
+def test_insert_text_keeps_citation_command_literal_via_mcp(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        document = tmp_path / "literal-citation.lyx"
+        shutil.copy2(FIXTURE, document)
+        async with Client(_server(tmp_path)) as client:
+            result = await client.call_tool(
+                "lyx_insert_text",
+                {"path": str(document), "anchor": "Gamma delta", "text": r" \cite{A}", "position": "after"},
+            )
+            assert result.structured_content["ok"] is True, result.structured_content
+            assert b"\\begin_inset CommandInset citation" not in document.read_bytes()
+            text = await client.call_tool("lyx_read", {"path": str(document), "format": "text"})
+            assert r"Gamma delta \cite{A}." in text.structured_content["content"]
+            latex = await client.call_tool("lyx_read", {"path": str(document), "format": "latex"})
+            assert r"\textbackslash cite\{A\}" in latex.structured_content["content"]
+            assert Path(result.structured_content["pdf"]).read_bytes().startswith(b"%PDF-")
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(("keys", "position"), [("A", "after"), ("A,B", "after"), ("A", "before")])
+def test_insert_citation_tracks_inset_via_mcp(tmp_path: Path, keys: str, position: str) -> None:
+    async def exercise() -> None:
+        (tmp_path / "refs.bib").write_text(
+            "@article{A, title={A}, author={Alpha}, year={2020}}\n"
+            "@article{B, title={B}, author={Beta}, year={2021}}\n"
+        )
+        bibliography = (
+            "\\begin_layout Standard\n\\begin_inset CommandInset bibtex\nLatexCommand bibtex\n"
+            'btprint "btPrintCited"\nbibfiles "refs"\noptions "plain"\nencoding "default"\n\n'
+            "\\end_inset\n\\end_layout\n"
+        )
+        document = tmp_path / "insert-citation.lyx"
+        document.write_text(FIXTURE.read_text().replace("\\end_body", bibliography + "\\end_body"))
+        arguments = {"path": str(document), "anchor": "Gamma delta", "keys": keys}
+        if position == "before":
+            arguments["position"] = position
+        async with Client(_server(tmp_path)) as client:
+            result = await client.call_tool("lyx_insert_citation", arguments)
+            assert result.structured_content["ok"] is True, result.structured_content
+            assert result.structured_content["tracking_changes"] is True
+            assert result.structured_content["output_changes"] is True
+            assert result.structured_content["merged_into_existing"] is False
+            source = document.read_text()
+            assert source.count("\\begin_inset CommandInset citation") == 1
+            assert f'key "{keys}"' in source
+            assert re.search(r"\\change_inserted \d+ \d+\n\s*\\begin_inset CommandInset citation", source)
+            latex = await client.call_tool("lyx_read", {"path": str(document), "format": "latex"})
+            assert f"\\cite{{{keys}}}" in latex.structured_content["content"]
+            assert Path(result.structured_content["pdf"]).read_bytes().startswith(b"%PDF-")
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("keys", ["B", "B,C"])
+def test_insert_citation_merges_adjacent_inset_via_mcp(tmp_path: Path, keys: str) -> None:
+    async def exercise() -> None:
+        (tmp_path / "refs.bib").write_text(
+            "@article{A, title={A}, author={Alpha}, year={2020}}\n"
+            "@article{B, title={B}, author={Beta}, year={2021}}\n"
+            "@article{C, title={C}, author={Gamma}, year={2022}}\n"
+        )
+        bibliography = (
+            "\\begin_layout Standard\n\\begin_inset CommandInset bibtex\nLatexCommand bibtex\n"
+            'btprint "btPrintCited"\nbibfiles "refs"\noptions "plain"\nencoding "default"\n\n'
+            "\\end_inset\n\\end_layout\n"
+        )
+        document = tmp_path / "merged-citation.lyx"
+        body = FIXTURE.read_text().replace("\\end_body", bibliography + "\\end_body")
+        body = body.replace("Gamma delta.", "Gamma delta\n" + _citation("A") + "\n.")
+        document.write_text(body)
+        async with Client(_server(tmp_path)) as client:
+            result = await client.call_tool(
+                "lyx_insert_citation",
+                {"path": str(document), "anchor": "Gamma delta", "keys": keys},
+            )
+            assert result.structured_content["ok"] is True, result.structured_content
+            assert result.structured_content["merged_into_existing"] is True
+            source = document.read_text()
+            assert source.count("\\begin_inset CommandInset citation") == 1
+            assert f'key "A,{keys}"' in source
+            latex = await client.call_tool("lyx_read", {"path": str(document), "format": "latex"})
+            assert f"\\cite{{A,{keys}}}" in latex.structured_content["content"]
+            assert Path(result.structured_content["pdf"]).read_bytes().startswith(b"%PDF-")
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("adjacent", [False, True])
+def test_insert_citation_rolls_back_undefined_key_via_mcp(tmp_path: Path, adjacent: bool) -> None:
+    async def exercise() -> None:
+        (tmp_path / "refs.bib").write_text("@article{A, title={A}, author={Alpha}, year={2020}}\n")
+        bibliography = (
+            "\\begin_layout Standard\n\\begin_inset CommandInset bibtex\nLatexCommand bibtex\n"
+            'btprint "btPrintCited"\nbibfiles "refs"\noptions "plain"\nencoding "default"\n\n'
+            "\\end_inset\n\\end_layout\n"
+        )
+        document = tmp_path / "failed-citation.lyx"
+        body = FIXTURE.read_text().replace("\\end_body", bibliography + "\\end_body")
+        if adjacent:
+            body = body.replace("Gamma delta.", "Gamma delta\n" + _citation("A") + "\n.")
+        document.write_text(body)
+        original = document.read_bytes()
+        async with Client(_server(tmp_path)) as client:
+            result = await client.call_tool(
+                "lyx_insert_citation",
+                {"path": str(document), "anchor": "Gamma delta", "keys": "MissingCitationProbe"},
+            )
+            assert result.structured_content["ok"] is False, result.structured_content
+            assert result.structured_content["error_code"] == "UNDEFINED_CITATIONS"
+            assert result.structured_content["rollback_verified"] is True
+            assert document.read_bytes() == original
+
+    asyncio.run(exercise())
 
 
 def _reference(name: str) -> str:

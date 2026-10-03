@@ -10,7 +10,7 @@ LyX MCP Server lets AI assistants edit LyX papers with tracked changes, includin
 - **LyX 2.4.x** installed locally. Set `[lyx].binary` to the absolute executable path. Another LyX version needs a dedicated `profile_seed_dir` and its own integration testing.
 - **Python 3.11 or newer**, `venv`, and `pip` to install the MCP server and dependencies.
 - **A working LaTeX toolchain** for `pdf2` export, including `pdflatex`, a bibliography tool such as `bibtex` for documents that use it, and the TeX packages required by the paper. Visible revisions require `xcolor.sty` and `ulem.sty`. Documents with SVG images may also need an SVG converter such as Inkscape.
-- **Writable paths:** `[lyx].runtime_root` must be writable and permit FIFOs and subprocesses. Each paper and any persistent export destination must be inside a configured `[security].allowed_roots` directory. The server user needs read access to bibliography and image assets and write access to the paper directory.
+- **Writable paths:** `[lyx].runtime_root` must be writable and permit FIFOs and subprocesses. Each paper and any persistent export destination must be inside a configured `[security].allowed_roots` directory. The server user needs read access to bibliography and image assets and write access to the paper directory. Also, be sure the PWD environment variable is currently set to a writable path (should be the same as `[lyx].runtime_root`.
 
 Check the base installation before configuring an MCP client:
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
 import re
 import shutil
@@ -8,11 +9,11 @@ import signal
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from .client import LyXClient
 from .config import Config
@@ -36,55 +37,43 @@ class Runtime:
         self.layout: Layout | None = None
         self.process: subprocess.Popen[bytes] | None = None
         self.client: LyXClient | None = None
-        self._retired_roots: list[Path] = []
+        self._lock_file: BinaryIO | None = None
 
     async def start(self) -> None:
         if self.process is not None:
             return
         self._check_binary()
-        root = Path(tempfile.mkdtemp(prefix="lyx-mcp-", dir=self.config.runtime_root))
-        root.chmod(0o700)
-        layout = Layout(
-            root=root,
-            userdir=root / "userdir",
-            temp=root / "tmp",
-            logs=root / "logs",
-            exports=root / "exports",
-            snapshots=root / "snapshots",
-            pipe_stem=root / "userdir" / "run" / "lyxserver",
-        )
-        self.layout = layout
-        for directory in (layout.userdir, layout.temp, layout.logs, layout.exports, layout.snapshots):
-            directory.mkdir(mode=0o700, exist_ok=True)
-        self._prepare_userdir(layout)
-        environment = os.environ.copy()
-        environment = {key: value for key, value in environment.items() if not key.startswith("LYX_USERDIR_")}
-        environment.update(
-            QT_QPA_PLATFORM="offscreen",
-            TMPDIR=str(layout.temp),
-            XDG_CACHE_HOME=str(root / "cache"),
-            XDG_CONFIG_HOME=str(root / "config"),
-            XDG_DATA_HOME=str(root / "data"),
-        )
-        with (layout.logs / "stdout.log").open("wb") as out, (layout.logs / "stderr.log").open("wb") as err:
-            self.process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "lyx_mcp.launch",
-                    str(os.getpid()),
-                    self.config.lyx_binary,
-                    "--no-remote",
-                    "-userdir",
-                    str(layout.userdir),
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=out,
-                stderr=err,
-                env=environment,
-                start_new_session=True,
-            )
         try:
+            layout = self._prepare_layout()
+            environment = os.environ.copy()
+            environment = {key: value for key, value in environment.items() if not key.startswith("LYX_USERDIR_")}
+            environment.update(
+                QT_QPA_PLATFORM="offscreen",
+                TMPDIR=str(layout.temp),
+                XDG_CACHE_HOME=str(layout.root / "cache"),
+                XDG_CONFIG_HOME=str(layout.root / "config"),
+                XDG_DATA_HOME=str(layout.root / "data"),
+            )
+            assert self._lock_file is not None
+            with (layout.logs / "stdout.log").open("wb") as out, (layout.logs / "stderr.log").open("wb") as err:
+                self.process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "lyx_mcp.launch",
+                        str(os.getpid()),
+                        self.config.lyx_binary,
+                        "--no-remote",
+                        "-userdir",
+                        str(layout.userdir),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=out,
+                    stderr=err,
+                    env=environment,
+                    start_new_session=True,
+                    pass_fds=(self._lock_file.fileno(),),
+                )
             await self._wait_for_pipes(layout)
             client = LyXClient(layout.pipe_stem, f"lyx-mcp-{uuid.uuid4().hex[:12]}", self.config.command_timeout_sec)
             client.connect()
@@ -94,6 +83,62 @@ class Runtime:
         except BaseException:
             await self.close(preserve=True)
             raise
+
+    def _acquire_root(self) -> Path:
+        pool = self.config.runtime_root / f"lyx-mcp-{os.getuid()}"
+        pool.mkdir(mode=0o700, exist_ok=True)
+        details = pool.lstat()
+        if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.getuid() or details.st_mode & 0o077:
+            raise LyXMCPError("UNSAFE_RUNTIME_ROOT", f"Runtime pool must be a private, user-owned directory: {pool}")
+        slot = 0
+        while True:
+            lock_file = os.fdopen(
+                os.open(pool / f"{slot}.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600), "r+b"
+            )
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                lock_file.close()
+                if isinstance(exc, BlockingIOError):
+                    slot += 1
+                    continue
+                raise
+            self._lock_file = lock_file
+            return pool / str(slot)
+
+    def _prepare_layout(self) -> Layout:
+        reset: tuple[Path, ...]
+        if self.layout is None:
+            root = self._acquire_root()
+            self.layout = Layout(
+                root=root,
+                userdir=root / "userdir",
+                temp=root / "tmp",
+                logs=root / "logs",
+                exports=root / "exports",
+                snapshots=root / "snapshots",
+                pipe_stem=root / "userdir" / "run" / "lyxserver",
+            )
+            reset = (root,)
+        else:
+            layout = self.layout
+            reset = (
+                layout.userdir,
+                layout.temp,
+                layout.logs,
+                layout.root / "cache",
+                layout.root / "config",
+                layout.root / "data",
+            )
+        for directory in reset:
+            if directory.exists():
+                shutil.rmtree(directory)
+        layout = self.layout
+        layout.root.mkdir(mode=0o700, exist_ok=True)
+        for directory in (layout.userdir, layout.temp, layout.logs, layout.exports, layout.snapshots):
+            directory.mkdir(mode=0o700, exist_ok=True)
+        self._prepare_userdir(layout)
+        return layout
 
     def _check_binary(self) -> None:
         if self.config.profile_seed_dir is not None:
@@ -159,10 +204,7 @@ class Runtime:
         return (self.layout.logs / "stderr.log").read_text(errors="replace")[-2000:]
 
     async def restart(self) -> None:
-        old_layout = self.layout
         await self.close(preserve=True)
-        if old_layout is not None:
-            self._retired_roots.append(old_layout.root)
         await self.start()
 
     async def close(self, preserve: bool = False) -> None:
@@ -192,13 +234,15 @@ class Runtime:
             if process.poll() is None:
                 process.wait()
             self.process = None
-        if self.layout is not None and not preserve:
-            shutil.rmtree(self.layout.root)
+        if preserve:
+            return
+        if self.layout is not None:
+            if self.layout.root.exists():
+                shutil.rmtree(self.layout.root)
             self.layout = None
-        if not preserve:
-            for root in self._retired_roots:
-                shutil.rmtree(root)
-            self._retired_roots.clear()
+        if self._lock_file is not None:
+            self._lock_file.close()
+            self._lock_file = None
 
     @staticmethod
     def _group_exists(pgid: int) -> bool:

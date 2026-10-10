@@ -101,7 +101,11 @@ Successful edits and imports set `\tracking_changes true` and `\output_changes t
 
 ## Process isolation and cleanup
 
-Each server launch creates a private `0700` runtime and userdir, configures a separate `\serverpipe "$$UserDir/run/lyxserver"`, and starts `lyx --no-remote -userdir ...` with `QT_QPA_PLATFORM=offscreen`. Tools share a single LyXServer client ID and an asynchronous lock. Desktop LyX instances are not reused or signaled.
+Each server launch claims a slot in the private `0700` pool `<runtime_root>/lyx-mcp-<uid>/`. A persistent `<slot>.lock` file holds an exclusive, nonblocking `flock` for the lifetime of the session. Concurrent instances claim separate slots, and later sessions reuse the first available slot after clearing its previous contents. The lock file stays outside the slot's runtime directory and remains in place during cleanup. LyX inherits the lock descriptor, so the slot remains reserved until both the MCP server and its LyX child release it.
+
+Each slot has a private runtime and userdir, a separate `\serverpipe "$$UserDir/run/lyxserver"`, and a `lyx --no-remote -userdir ...` process with `QT_QPA_PLATFORM=offscreen`. Tools share a single LyXServer client ID and an asynchronous lock. Internal LyX restarts reuse the same slot, reset the profile, pipes, logs, caches, and temporary compilation files, and retain exports and rollback snapshots until the session ends. Normal shutdown removes the runtime contents before releasing the lock. Abrupt shutdown leaves contents for cleanup when that slot is next claimed; slot count follows peak concurrent use rather than total launches.
+
+For `/tmp` backed by tmpfs, `runtime_root` can also point to a writable directory on disk. Random-name `lyx-mcp-*` directories from earlier versions require separate cleanup after their owning instances have stopped.
 
 On a normal shutdown, the server asks LyX to quit, sends SIGTERM to its **own** process group, and sends SIGKILL after a three-second grace period if that group remains. On Linux, the LyX launcher also sets a parent-death signal before executing LyX, so an abruptly killed MCP server does not leave its LyX child running. A previous version only attempted cleanup from the normal shutdown path and could leave an orphan if the MCP process died first. A CPU-heavy LyX process that ignores SIGTERM therefore triggers the SIGKILL fallback; its underlying busy-loop cause cannot be diagnosed without that process's log or stack trace. The server never signals unrelated desktop LyX processes.
 

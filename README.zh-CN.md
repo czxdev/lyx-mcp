@@ -101,7 +101,11 @@ server 只通过 stdout 传输 MCP 协议。LyX 的 stdout 和 stderr 写入独�
 
 ## 进程隔离与清理
 
-每个 server 启动时创建权限为 `0700` 的私有 runtime 和 userdir，设置独立的 `\serverpipe "$$UserDir/run/lyxserver"`，并以 `lyx --no-remote -userdir ...` 和 `QT_QPA_PLATFORM=offscreen` 启动 LyX。所有工具共享一个 LyXServer client ID 和一把异步锁。桌面 LyX 实例不会被复用或发送信号。
+每个 server 启动时，在权限为 `0700` 的私有目录池 `<runtime_root>/lyx-mcp-<uid>/` 中取得一个槽位。持久的 `<slot>.lock` 文件通过非阻塞的独占 `flock` 锁定整个会话。并发实例各自取得独立槽位，后续会话复用首个空闲槽位，并先清理其中的旧内容。锁文件位于槽位的 runtime 目录之外，清理时保留。LyX 继承锁的文件描述符，因此槽位会一直保留到 MCP server 和 LyX 子进程均释放该描述符。
+
+每个槽位包含私有 runtime 和 userdir，设置独立的 `\serverpipe "$$UserDir/run/lyxserver"`，并以 `lyx --no-remote -userdir ...` 和 `QT_QPA_PLATFORM=offscreen` 启动 LyX。所有工具共享一个 LyXServer client ID 和一把异步锁。LyX 内部重启沿用同一槽位，重建 profile、管道、日志、缓存和编译临时文件，并保留导出文件与回滚快照直至会话结束。正常退出在释放锁前删除 runtime 内容；异常退出的残留在该槽位下次被取得时清理。槽位数量随并发使用峰值增长。
+
+如果 `/tmp` 使用 tmpfs，也可将 `runtime_root` 指向磁盘上的可写目录。旧版本创建的随机名称 `lyx-mcp-*` 目录，应在对应实例停止后单独清理。
 
 正常退出时，server 先请求 LyX 退出，再向**自身**进程组发送 SIGTERM；如果三秒宽限期后该进程组仍存活，则发送 SIGKILL。在 Linux 上，LyX 启动器还会在执行 LyX 前设置父进程死亡信号，确保 MCP server 被突然终止后，其 LyX 子进程也随之退出。旧版仅尝试在正常关闭路径中清理，如果 MCP 进程先退出，可能遗留孤儿进程。因此，占用大量 CPU 且忽略 SIGTERM 的 LyX 进程会触发 SIGKILL 后备清理；诊断底层忙循环原因需要该进程的日志或堆栈跟踪。server 始终只向自身进程组发送信号。
 

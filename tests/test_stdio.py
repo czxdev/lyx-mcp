@@ -18,7 +18,10 @@ def test_stdio_mcp_edit_and_read(tmp_path: Path) -> None:
         document = tmp_path / "document.lyx"
         shutil.copy2(FIXTURE, document)
         config = tmp_path / "config.toml"
-        config.write_text(f"[security]\nallowed_roots = [{json.dumps(str(tmp_path))}]\n")
+        config.write_text(
+            f"[lyx]\nruntime_root = {json.dumps(str(tmp_path.parent))}\n"
+            f"[security]\nallowed_roots = [{json.dumps(str(tmp_path))}]\n"
+        )
         environment = dict(
             os.environ,
             PYTHONPATH=str(Path(__file__).parent.parent / "src"),

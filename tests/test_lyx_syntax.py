@@ -30,7 +30,10 @@ def _document(body: str, author: bool = False) -> str:
 
 def _server(tmp_path: Path) -> StdioServerParameters:
     config = tmp_path / "config.toml"
-    config.write_text(f"[lyx]\nexport_timeout_sec = 60\n[security]\nallowed_roots = [{json.dumps(str(tmp_path))}]\n")
+    config.write_text(
+        f"[lyx]\nruntime_root = {json.dumps(str(tmp_path.parent))}\nexport_timeout_sec = 60\n"
+        f"[security]\nallowed_roots = [{json.dumps(str(tmp_path))}]\n"
+    )
     return StdioServerParameters(
         command=sys.executable,
         args=["-m", "lyx_mcp"],

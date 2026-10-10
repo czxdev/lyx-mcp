@@ -30,7 +30,7 @@ def test_native_citation_insert_in_isolated_lyx(tmp_path: Path, keys: str) -> No
         )
         document = tmp_path / "native-citation.lyx"
         document.write_text(FIXTURE.read_text().replace("\\end_body", bibliography + "\\end_body"))
-        service = LyXService(Config(allowed_roots=(tmp_path,), export_timeout_sec=40))
+        service = LyXService(Config(runtime_root=tmp_path.parent, allowed_roots=(tmp_path,), export_timeout_sec=40))
         await service.start()
         try:
             await service.read(str(document))
@@ -70,6 +70,7 @@ def test_native_citation_insert_in_isolated_lyx(tmp_path: Path, keys: str) -> No
 def test_isolated_lyx_edit_compile_and_rollback(tmp_path: Path) -> None:
     async def exercise() -> None:
         config = Config(
+            runtime_root=tmp_path.parent,
             allowed_roots=(tmp_path,),
             checker_profiles={"fail": CheckerProfile(("false",), 5)},
             export_timeout_sec=40,
@@ -150,6 +151,8 @@ def test_isolated_lyx_edit_compile_and_rollback(tmp_path: Path) -> None:
             assert rejected["error_code"] == "PDF_COMPILE_FAILED"
             assert rejected["rollback_verified"] is True
             assert broken.read_bytes() == broken_original
+            assert service.layout.root == layout.root
+            assert pdf.read_bytes().startswith(b"%PDF-")
 
             missing_citation = tmp_path / "missing-citation.lyx"
             citation = (
@@ -173,7 +176,7 @@ def test_isolated_lyx_edit_compile_and_rollback(tmp_path: Path) -> None:
 @pytest.mark.skipif(shutil.which("lyx") is None, reason="LyX is not installed")
 def test_real_lyx_text_primitives_and_second_isolated_runtime(tmp_path: Path) -> None:
     async def exercise() -> None:
-        config = Config(allowed_roots=(tmp_path,), export_timeout_sec=30)
+        config = Config(runtime_root=tmp_path.parent, allowed_roots=(tmp_path,), export_timeout_sec=30)
         first = LyXService(config)
         second = LyXService(config)
         await first.start()
@@ -305,7 +308,7 @@ def test_output_changes_unsafe_resizebox_is_repaired(tmp_path: Path) -> None:
         )
         source = source.replace("\\end_header", '\\author 0 "Test" ""\n\\end_header')
         document.write_text(source)
-        service = LyXService(Config(allowed_roots=(tmp_path,), export_timeout_sec=45))
+        service = LyXService(Config(runtime_root=tmp_path.parent, allowed_roots=(tmp_path,), export_timeout_sec=45))
         await service.start()
         try:
             baseline = (await service.read(str(document)))["content"]

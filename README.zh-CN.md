@@ -56,48 +56,24 @@ server 只通过 stdout 传输 MCP 协议。LyX 的 stdout 和 stderr 写入独�
 
 ## 工具
 
+MCP 接口已合并为四个工具：
+
 | 工具 | 用途 |
 | --- | --- |
-| `lyx_get_document_state` | 查询路径、SHA256、Track Changes 和 autosave 状态 |
-| `lyx_read` | 由 LyX 导出接受修订后的纯文本或 LaTeX |
-| `lyx_apply_edits` | 批量执行 `replace`、`delete`、`insert_before` 和 `insert_after`；默认编译 |
-| `lyx_replace_text`、`lyx_delete_text`、`lyx_insert_text` | 单项编辑的便捷接口 |
-| `lyx_insert_citation` | 在普通正文锚点前后插入引用；与已有引用相邻时允许 LyX 合并，默认编译 PDF |
-| `lyx_export` | 导出 text、latex 或 pdf2；可复制到允许目录中的新文件 |
-| `lyx_validate_revision` | 检查 Track Changes 并编译当前文档或 master |
-| `lyx_import_revision_range` | 将另一份 `.lyx` 中已追踪的连续 Section 区间导入目标，并编译验证 |
-| `lyx_normalize_revisions` | 合并指定作者及时间戳的碎片化修订，处理不安全的 `resizebox` ERT 替换，并编译验证 |
+| `lyx_read` | 一次读取版本状态、目录、指定章节/段落、搜索结果和 inset 信息；按需读取构建产物或 PDF 批注 |
+| `lyx_apply_edits` | 带版本前置条件的混合编辑事务：统一预检、保护指定范围、验证、编译和最终 PDF 交付 |
+| `lyx_compare` | 两方或三方文本比较、小范围修改片段、上下文和冲突；支持选择性重新应用 |
+| `lyx_job` | 查询状态、有限等待、取消；终态说明是否提交、回滚及能否重试 |
 
-批量编辑示例：
+先通过 `lyx_read` 获取需要的章节与 `state.sha256`，再将它作为 `expected_sha256` 提交。节点 ID 绑定文档版本；一个批次中的全部操作针对同一基线解析，并使用调用方提供的唯一 `id` 返回结果。默认读取直接解析已保存源文件，不启动 LyX，也不会将隐藏 Note 中的相同文字误作正文锚点。用 `selector`、`search`、`representations` 和返回长度限制减少无关内容。
 
-```json
-{
-  "path": "/absolute/path/to/paper.lyx",
-  "edits": [
-    {
-      "op": "replace",
-      "old_text": "The method achieve better results.",
-      "new_text": "The method achieves better results."
-    },
-    {
-      "op": "insert_after",
-      "anchor": "This is the final paragraph.",
-      "text": "\nA new paragraph."
-    }
-  ],
-  "compile": true
-}
-```
+混合批次支持正文、文献引用、段落拆分/合并、段落样式、段落移动、公式、交叉引用、表格单元格、标题、已审阅 Section 修订导入和修订归并。跨 inset 替换必须在新文本中保留对应 token，并在 `preserve_insets` 中列出相同顺序的 ID。`protect` 与 `assertions` 可保护已完成章节和指定 inset。结构修改会明确报告 LyX 是否能将其显示为修订。
 
-通常要求每个目标在 LyX 导出的接受修订后纯文本中精确且唯一，并能映射到 `.lyx` 源文件中连续的普通文字。重复文本可用 `context_before` 和 `context_after` 消歧，再用 `occurrence` 指定匹配项。替换操作自动收缩相同的前后文字，同时保留合理的整词或数值范围边界。句子整体重写仍作为一个连续修订。跨公式或其他 inset 的目标会在 LyX 搜索前被拒绝。按文献 key 新增引用时使用 `lyx_insert_citation`；导入已审阅的结构性修订（包括已有的引用 inset）时使用 `lyx_import_revision_range`。插入文本中的 `\n` 表示段落分隔，且只支持在段落边界处插入。
+事务在临时副本上统一修改，由隔离 LyX 保存一次、验证一次、编译一次；全部通过后才原子替换目标文件。`output_path` 可以直接保存最终带修订 PDF。失败或取消后先查看终态，再决定是否重新读取并重试。
 
-`lyx_insert_citation` 接收 `path`、`anchor` 和 `keys`，默认在锚点后插入；多个 key 用逗号分隔，`position="before"` 可改为锚点前。独立插入的引用 inset 带修订记录；LyX 将 key 合并到紧邻的已有引用时也视为成功，并返回 `merged_into_existing=true`。默认编译 PDF，文献库中不存在的 key 会导致回滚；需要空格时另作普通文本编辑。
+编译返回可复用的 `build_id`。文档与依赖指纹不变时，验证和导出复用同一构建。使用 `lyx_read(build_id=...,artifact="latex"/"log"/"aux"/"bbl"/"pdf"/"manifest")` 按需读取结果；manifest 包含全部文件、诊断和文献/交叉引用映射。普通写响应不会返回全文或完整日志。超时涵盖排队与 IPC，长操作通过 job ID 查询和取消。
 
-导入工具需要源、目标各自的 SHA256，以及相同且唯一的起止 Section 标题。它复制起始 Section 到结束 Section 之前的 LyX 标记，补齐修订作者，然后在独立 LyX 中重新打开、保存和编译结果。源区间必须已有 Track Changes 标记，目标区间不能已有修订标记。整个目标区间会被替换，不做三方合并，因此使用前应比对完整区间。
-
-所有成功的编辑与导入均会设置 `\tracking_changes true` 和 `\output_changes true`。编译会检查 TeX 致命错误和最终日志中的未定义引用。`lyx_normalize_revisions` 将同一作者和时间戳的相邻修订合成可读的短语或句子，同时保留接受和拒绝修订后的正文。它会将不安全的 `resizebox` ERT 开口替换接受为结构性格式变动，并报告数量。随附的 [LyX 论文编辑 skill](skill/lyx-paper-editing/SKILL.md) 说明选择修订范围的方法及已测试的 LyX 语法。在普通 LyX 正文和图表标题中，数值范围应使用 `10-50`；`10--50` 是原始 TeX 输入语法，应避免复制到 LyX 正文中。
-
-`checker_profile` 只能引用配置中的固定命令。`master_path` 可用于编辑 child 文档后编译 master；目前尚未用真实多文件论文完成集成验证。`lyx_export` 的默认产物位于临时 runtime，server 退出后会删除；需要保留时传入 `output_path`，目标必须在 `allowed_roots` 中且尚不存在。
+旧的 Python service 方法仍保留兼容性，旧 MCP 便捷工具名称已合并。升级后应重启 MCP 连接并同步[编辑 skill](skill/lyx-paper-editing/SKILL.md)。完整参数与边界见 [README](README.md#agent-interface) 和[接口设计](docs/interface.md)。当前原生 LaTeX 导出仍针对全文；结构/inset 比较冲突需要明确操作和人工审阅。PDF 批注提取与渲染是可选功能，需要安装 `pdf` extra。
 
 ## 进程隔离与清理
 

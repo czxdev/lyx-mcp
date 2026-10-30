@@ -207,6 +207,25 @@ class Runtime:
         await self.close(preserve=True)
         await self.start()
 
+    async def abort(self) -> None:
+        if self.client is not None:
+            self.client._broken = True
+            self.client.close()
+            self.client = None
+        process = self.process
+        if process is None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 3
+        while process.poll() is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        if process.poll() is None:
+            raise LyXMCPError("RECOVERY_FAILED", "isolated LyX did not exit after SIGKILL")
+        self.process = None
+
     async def close(self, preserve: bool = False) -> None:
         process = self.process
         if process is not None and process.poll() is None and self.client is not None:

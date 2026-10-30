@@ -1,6 +1,6 @@
 [lyx]
 binary = "/usr/bin/lyx"
-runtime_root = "/tmp"
+runtime_root = "/var/tmp"
 startup_timeout_sec = 45
 command_timeout_sec = 30
 export_timeout_sec = 180

@@ -3,13 +3,12 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 
 from .config import load_config
-from .edit import EditSpec
 from .service import LyXService
 
 
@@ -21,7 +20,6 @@ class AppContext:
 @asynccontextmanager
 async def lifespan(_server: MCPServer) -> AsyncIterator[AppContext]:
     service = LyXService(load_config())
-    await service.start()
     try:
         yield AppContext(service)
     finally:
@@ -32,150 +30,142 @@ mcp = MCPServer("lyx-mcp", lifespan=lifespan)
 
 
 @mcp.tool()
-async def lyx_get_document_state(path: str, ctx: Context[AppContext]) -> dict[str, object]:
-    """Read a LyX document's checksum and Track Changes state."""
-    return await ctx.request_context.lifespan_context.service.get_document_state(path)
+async def lyx_read(
+    path: str,
+    ctx: Context[AppContext],
+    selector: dict[str, Any] | None = None,
+    search: str | None = None,
+    representations: list[str] | None = None,
+    max_chars: int = 12000,
+    content_offset: int = 0,
+    content_limit: int = 4000,
+    format: Literal["text", "latex"] | None = None,
+    build: bool = False,
+    validate: bool = False,
+    build_id: str | None = None,
+    artifact: str | None = None,
+    output_path: str | None = None,
+    pdf: dict[str, Any] | None = None,
+    timeout_sec: float = 180,
+    wait_sec: float = 1,
+) -> dict[str, Any]:
+    """Read versioned state/outline and scoped text/source/nodes without LyX IPC.
 
-
-@mcp.tool()
-async def lyx_read(path: str, ctx: Context[AppContext], format: Literal["text", "latex"] = "text") -> dict[str, str]:
-    """Read text or LaTeX exported by an isolated LyX process."""
-    return await ctx.request_context.lifespan_context.service.read(path, format)
+    selector: node_ids, section (ID or exact title), from_node, to_before_node,
+    offset and limit. Inset tokens in text can be retained by editing operations.
+    Native format exports are explicit whole-document requests, bounded by
+    content_offset/content_limit. build/validate retain one reusable compilation;
+    build_id+artifact reads its outputs or saves one to a new output_path.
+    pdf optionally extracts annotations or renders pages (requires the pdf extra).
+    Slow requests return job_id; use lyx_job for status, bounded wait or cancel.
+    """
+    service = ctx.request_context.lifespan_context.service
+    return await service.jobs.submit(
+        "read",
+        lambda: service.read_document(
+            path,
+            selector,
+            search,
+            representations,
+            max_chars,
+            format,
+            build,
+            build_id,
+            artifact,
+            output_path,
+            content_offset,
+            content_limit,
+            validate,
+            pdf,
+        ),
+        timeout_sec,
+        wait_sec,
+    )
 
 
 @mcp.tool()
 async def lyx_apply_edits(
     path: str,
-    edits: list[EditSpec],
+    expected_sha256: str,
+    operations: list[dict[str, Any]],
     ctx: Context[AppContext],
-    master_path: str | None = None,
-    compile: bool = True,
-    checker_profile: str | None = None,
-) -> dict[str, object]:
-    """Apply a batch of tracked text edits and roll back if verification fails."""
-    return await ctx.request_context.lifespan_context.service.apply_edits(
-        path, edits, master_path, compile, checker_profile
-    )
-
-
-@mcp.tool()
-async def lyx_replace_text(
-    path: str,
-    old_text: str,
-    new_text: str,
-    ctx: Context[AppContext],
-    master_path: str | None = None,
-    compile: bool = True,
-) -> dict[str, object]:
-    """Replace one uniquely identified text span with Track Changes enabled."""
-    edit = EditSpec(op="replace", old_text=old_text, new_text=new_text)
-    return await ctx.request_context.lifespan_context.service.apply_edits(path, [edit], master_path, compile)
-
-
-@mcp.tool()
-async def lyx_delete_text(
-    path: str, old_text: str, ctx: Context[AppContext], compile: bool = True
-) -> dict[str, object]:
-    """Delete one uniquely identified text span with Track Changes enabled."""
-    edit = EditSpec(op="delete", old_text=old_text)
-    return await ctx.request_context.lifespan_context.service.apply_edits(path, [edit], compile=compile)
-
-
-@mcp.tool()
-async def lyx_insert_text(
-    path: str,
-    anchor: str,
-    text: str,
-    position: Literal["before", "after"],
-    ctx: Context[AppContext],
-    compile: bool = True,
-) -> dict[str, object]:
-    """Insert text before or after a unique plain-text anchor."""
-    op: Literal["insert_before", "insert_after"] = "insert_before" if position == "before" else "insert_after"
-    edit = EditSpec(op=op, anchor=anchor, text=text)
-    return await ctx.request_context.lifespan_context.service.apply_edits(path, [edit], compile=compile)
-
-
-@mcp.tool()
-async def lyx_insert_citation(
-    path: str,
-    anchor: str,
-    keys: str,
-    ctx: Context[AppContext],
-    position: Literal["before", "after"] = "after",
-    occurrence: int = 1,
-    require_unique: bool = True,
-    context_before: str | None = None,
-    context_after: str | None = None,
-    master_path: str | None = None,
-    compile: bool = True,
-    checker_profile: str | None = None,
-) -> dict[str, object]:
-    """Insert a tracked citation inset at a plain-text anchor and validate the document."""
-    return await ctx.request_context.lifespan_context.service.insert_citation(
-        path,
-        anchor,
-        keys,
-        position,
-        occurrence,
-        require_unique,
-        context_before,
-        context_after,
-        master_path,
-        compile,
-        checker_profile,
-    )
-
-
-@mcp.tool()
-async def lyx_export(
-    path: str,
-    format: Literal["text", "latex", "pdf2"],
-    ctx: Context[AppContext],
+    protect: list[dict[str, str]] | None = None,
+    validation: dict[str, Any] | None = None,
+    assertions: dict[str, Any] | None = None,
     output_path: str | None = None,
-) -> dict[str, object]:
-    """Export a LyX document as plain text, LaTeX, or PDF."""
-    return await ctx.request_context.lifespan_context.service.export(path, format, output_path)
-
-
-@mcp.tool()
-async def lyx_validate_revision(
-    path: str,
-    ctx: Context[AppContext],
     master_path: str | None = None,
     checker_profile: str | None = None,
-) -> dict[str, object]:
-    """Check Track Changes and compile the document or its master to PDF."""
-    return await ctx.request_context.lifespan_context.service.validate_revision(path, master_path, checker_profile)
+    timeout_sec: float = 180,
+    wait_sec: float = 1,
+) -> dict[str, Any]:
+    """Preflight one version-bound mixed batch; verify/compile once, then commit atomically.
 
-
-@mcp.tool()
-async def lyx_import_revision_range(
-    path: str,
-    source_path: str,
-    start_heading: str,
-    end_heading: str,
-    expected_sha256: str,
-    source_sha256: str,
-    ctx: Context[AppContext],
-    compile: bool = True,
-) -> dict[str, object]:
-    """Import tracked LyX section markup, including formulas and references, then validate it."""
-    return await ctx.request_context.lifespan_context.service.import_revision_range(
-        path, source_path, start_heading, end_heading, expected_sha256, source_sha256, compile
+    Each operation needs id and op. Supported: replace_text/delete_text,
+    insert_before/insert_after, replace_selection (preserve_insets + inset tokens),
+    insert_citation, set_citation, set_reference/set_inset_properties, edit_formula,
+    split_paragraph, join_paragraphs, set_layout, move_passage, edit_table_cell
+    (zero-based row/column), set_caption, import_revision_range,
+    normalize_revisions, and apply_hunk (compare_id/hunk_id).
+    Nodes and selections always refer to the baseline read, even within a batch.
+    protect uses from_node/to_before_node. assertions: unchanged_insets,
+    only_regions, tracking_enabled. validation: compile (default true),
+    visible_revisions, preserve_unedited_insets, no_unresolved.
+    output_path optionally delivers the final PDF to a new allowed path.
+    Structural operations explicitly report their visible tracking limitations.
+    After cancellation, inspect transaction_status before considering a retry.
+    """
+    service = ctx.request_context.lifespan_context.service
+    return await service.jobs.submit(
+        "edit",
+        lambda: service.transact(
+            path,
+            expected_sha256,
+            operations,
+            protect,
+            validation,
+            assertions,
+            output_path,
+            master_path,
+            checker_profile,
+        ),
+        timeout_sec,
+        wait_sec,
     )
 
 
 @mcp.tool()
-async def lyx_normalize_revisions(
+async def lyx_compare(
     path: str,
-    expected_sha256: str,
-    author_id: int,
-    timestamp: int,
+    revised_path: str,
     ctx: Context[AppContext],
-    compile: bool = True,
-) -> dict[str, object]:
-    """Merge fragmented tracked text and accept unsafe resizebox ERT replacements transactionally."""
-    return await ctx.request_context.lifespan_context.service.normalize_revisions(
-        path, expected_sha256, author_id, timestamp, compile
+    base_path: str | None = None,
+    offset: int = 0,
+    limit: int = 20,
+    max_chars: int = 12000,
+    timeout_sec: float = 60,
+    wait_sec: float = 1,
+) -> dict[str, Any]:
+    """Compare base -> previous revision -> current path; return reviewable small hunks.
+
+    Omitting base_path makes a two-way comparison. apply_hunk selectively reapplies
+    safe text hunks against the returned current version. Current-author overlap,
+    paragraph restructuring and changed inset contents are flagged for review.
+    """
+    service = ctx.request_context.lifespan_context.service
+    return await service.jobs.submit(
+        "compare",
+        lambda: service.compare(path, revised_path, base_path, offset, limit, max_chars),
+        timeout_sec,
+        wait_sec,
     )
+
+
+@mcp.tool()
+async def lyx_job(
+    job_id: str,
+    ctx: Context[AppContext],
+    action: Literal["status", "wait", "cancel"] = "status",
+    wait_sec: float = 0,
+) -> dict[str, Any]:
+    """Inspect, wait at most 30 seconds, or cancel a job; terminal outcomes remain queryable."""
+    return await ctx.request_context.lifespan_context.service.jobs.inspect(job_id, action, wait_sec)

@@ -90,7 +90,7 @@ class LyXClient:
             if not (isinstance(exc, LyXMCPError) and exc.code == "LYX_COMMAND_FAILED"):
                 self._broken = True
             if isinstance(exc, TimeoutError):
-                raise LyXMCPError("LYX_TIMEOUT", str(exc)) from exc
+                raise LyXMCPError("LYX_TIMEOUT", f"{function}: {exc}") from exc
             raise
 
     def _next_line(self) -> bytes | None:

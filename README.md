@@ -44,7 +44,7 @@ cp -a skill/lyx-paper-editing ~/.codex/skills/
 
 If you use a custom Codex skills directory, copy the skill there instead. Other MCP clients can use the server without the skill.
 
-Edit `config.toml`: set `binary` to the absolute LyX path, `runtime_root` to a writable directory (the default is `/tmp`), and `allowed_roots` to the **absolute directories** containing the papers and persistent exports. The placeholder `/absolute/path/to/papers` must be replaced. A paper outside these roots is rejected. `config.toml` is not tracked by Git.
+Edit `config.toml`: set `binary` to the absolute LyX path, `runtime_root` to a writable directory (the default follows Python’s temporary-directory environment), and `allowed_roots` to the **absolute directories** containing the papers and persistent exports. The placeholder `/absolute/path/to/papers` must be replaced. A paper outside these roots is rejected. `config.toml` is not tracked by Git.
 
 Configure your MCP client to start the server over **stdio**. Use the absolute path to this repository's `.venv/bin/lyx-mcp` as `command`, and set `LYX_MCP_CONFIG` to the absolute path of `config.toml` in its environment. The client launches the command when needed; a separate permanently running server is unnecessary. To run it manually, start the command below; it waits for MCP requests on stdin and can be stopped with Ctrl+C:
 
@@ -54,50 +54,44 @@ LYX_MCP_CONFIG="$PWD/config.toml" .venv/bin/lyx-mcp
 
 The server writes only MCP protocol traffic to stdout. LyX stdout and stderr go to files in the isolated runtime directory.
 
-## Tools
+## Agent interface
+
+The default MCP surface has four tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `lyx_get_document_state` | Read path, SHA256, Track Changes settings, and autosave state |
-| `lyx_read` | Export accepted plain text or LaTeX through LyX |
-| `lyx_apply_edits` | Batch `replace`, `delete`, `insert_before`, and `insert_after` operations; compile by default |
-| `lyx_replace_text`, `lyx_delete_text`, `lyx_insert_text` | Single-edit convenience tools |
-| `lyx_insert_citation` | Insert a citation before or after a plain-text anchor, merging with an adjacent citation when LyX does; compile by default |
-| `lyx_export` | Export text, latex, or pdf2; optionally copy to a new file in an allowed directory |
-| `lyx_validate_revision` | Check Track Changes and compile the current document or its master |
-| `lyx_import_revision_range` | Import a tracked, continuous Section range from another `.lyx` file and compile |
-| `lyx_normalize_revisions` | Merge fragmented revisions from a given author and timestamp, handle unsafe `resizebox` ERT replacements, and compile |
+| `lyx_read` | Versioned state, outline, scoped text/source/nodes, search, native exports, cached builds and artifacts, optional PDF inspection |
+| `lyx_apply_edits` | One version-checked mixed transaction with preflight, protection assertions, verification, one compilation, and optional final PDF delivery |
+| `lyx_compare` | Two/three-way text hunks, unchanged context, conflicts, and selective reapplication |
+| `lyx_job` | Status, bounded waiting, and cancellation with terminal transaction and recovery outcomes |
 
-Example batch edit:
+Read a Section or paragraph before editing. Node IDs are bound to its SHA256. The source-backed read avoids LyX IPC and hidden-note search ambiguity; whole-document native exports remain explicit requests. Responses are bounded and paginated.
 
 ```json
 {
   "path": "/absolute/path/to/paper.lyx",
-  "edits": [
+  "expected_sha256": "SHA256_FROM_READ",
+  "operations": [
     {
-      "op": "replace",
+      "id": "wording",
+      "op": "replace_text",
+      "node_id": "PARAGRAPH_ID_FROM_READ",
       "old_text": "The method achieve better results.",
       "new_text": "The method achieves better results."
-    },
-    {
-      "op": "insert_after",
-      "anchor": "This is the final paragraph.",
-      "text": "\nA new paragraph."
     }
   ],
-  "compile": true
+  "validation": {"compile": true, "preserve_unedited_insets": true},
+  "output_path": "/absolute/path/to/final-tracked.pdf"
 }
 ```
 
-Each target normally must be an exact, unique match in LyX's accepted plain-text export and map to continuous ordinary text in the `.lyx` source. Use `context_before` and `context_after`, then `occurrence`, to disambiguate repeated text. Replacement narrows identical prefixes and suffixes while preserving sensible word or numeric-range boundaries. A sentence rewrite remains one contiguous revision. Targets crossing formulas or other insets are rejected before the LyX search. Use `lyx_insert_citation` to add a citation by bibliography key and `lyx_import_revision_range` to import a reviewed structural revision, including an existing citation inset. A `\n` in inserted text separates paragraphs and is supported only at a paragraph boundary.
+`operations` also supports citations, explicit paragraph splitting/joining, layout and passage moves, formula/reference updates, table cells/captions, reviewed Section imports, revision normalization, and selected comparison hunks. Cross-inset replacements retain typed inset tokens and list their IDs in `preserve_insets`. Every operation resolves against one baseline. Invalid operations are reported together before mutation. Structural operations report whether LyX can visibly track them.
 
-`lyx_insert_citation` takes `path`, `anchor`, and comma-separated `keys`. It inserts after the anchor by default; set `position="before"` to insert before it. A separate new inset is tracked, while LyX may merge keys into an adjacent citation and report `merged_into_existing=true`. The PDF is compiled by default; undefined keys cause rollback. Add any needed space with an ordinary text edit.
+The server applies source patches to a disposable candidate, loads and saves it once in isolated LyX, verifies accepted content and inset properties, and compiles before an atomic target replacement. Cancellation before commit leaves the target unchanged. Deadline/recovery results expose the failing stage, transaction status and whether retrying is safe. A Linux asynchronous pipe transport avoids blocking stdio worker reads.
 
-Import requires source and target SHA256 values and identical, unique start and end Section headings. It copies the LyX markup from the start Section up to the end Section, adds the revision author, then reopens, saves, and compiles the result in isolated LyX. The source range must already contain Track Changes markers and the target range must have none. The entire target range is replaced, without a three-way merge, so compare the full range first.
+A successful compile returns `build_id` and PDF/LaTeX/log/auxiliary handles. `lyx_read(validate=true)` and artifact export reuse the build while source and dependency hashes match. `lyx_read(build_id=...,artifact="manifest")` provides all retained file handles, diagnostics, and citation/reference mappings; textual artifact retrieval supports offsets and limits. `output_path` saves a new artifact in an allowed directory. Session artifacts otherwise expire at shutdown. A `pdf` optional dependency enables annotation extraction and page rendering through read modes; install it with `pip install -e '.[pdf]'`.
 
-Successful edits and imports set `\tracking_changes true` and `\output_changes true`. Compilation checks both fatal TeX errors and undefined citations in the final log. `lyx_normalize_revisions` joins adjacent edits by the same author and timestamp into readable phrases or sentences while preserving the accepted and rejected text. It accepts unsafe `resizebox` ERT opening replacements as structural formatting changes and reports their count. The [LyX paper editing skill](skill/lyx-paper-editing/SKILL.md) gives revision-span guidance and lists tested LyX syntax. In ordinary LyX text and captions, use `10-50` for a numeric range; `10--50` is raw TeX input syntax and should not be copied into LyX prose.
-
-`checker_profile` can select only a fixed command from the configuration. `master_path` can compile a master after a child edit; real multi-file integration remains unverified. Default `lyx_export` artifacts reside in the temporary runtime and are deleted when the server exits. To keep one, pass a new `output_path` within `allowed_roots`.
+The Python service's older methods remain for compatibility; old MCP convenience tool names have been consolidated. Restart the MCP connection and update the bundled [editing skill](skill/lyx-paper-editing/SKILL.md) together. See [interface design and limits](docs/interface.md) for the contract. Scoped native LaTeX exports and automatic reapplication of structural/inset conflicts are not implemented; use scoped source/nodes and explicit operations for those cases. Multi-file master builds have a staging implementation but need project-specific integration checks.
 
 ## Process isolation and cleanup
 
@@ -116,13 +110,13 @@ The built-in profile is verified for local LyX 2.4.x. For another version, confi
 ## Tests
 
 ```bash
-PYTHONPATH=src .venv/bin/mypy src
+PYTHONPATH=src .venv/bin/python -m mypy src
 .venv/bin/ruff check src tests
-PYTHONPATH=src .venv/bin/pytest -q
+PYTHONPATH=src .venv/bin/python -m pytest -q
 ```
 
 The default suite starts isolated local LyX processes and uses temporary `.lyx` copies to test revisions, PDF export, text edits, rollback, and process cleanup. The stdio MCP and LyX syntax tests need local IPC access:
 
 ```bash
-LYX_MCP_RUN_STDIO_TEST=1 PYTHONPATH=src .venv/bin/pytest -q tests/test_stdio.py tests/test_lyx_syntax.py
+LYX_MCP_RUN_STDIO_TEST=1 PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_stdio.py tests/test_lyx_syntax.py
 ```

@@ -14,6 +14,7 @@ lyx-mcp = "lyx_mcp.__main__:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.11", "mypy>=1.15"]
+pdf = ["pymupdf>=1.24,<2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

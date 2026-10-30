@@ -1,8 +1,10 @@
-from .server import mcp
+import asyncio
+
+from .stdio import run
 
 
 def main() -> None:
-    mcp.run(transport="stdio")
+    asyncio.run(run())
 
 
 if __name__ == "__main__":

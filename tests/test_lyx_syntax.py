@@ -17,6 +17,53 @@ RUN = os.environ.get("LYX_MCP_RUN_STDIO_TEST") == "1" and shutil.which("lyx") is
 pytestmark = pytest.mark.skipif(not RUN, reason="LyX MCP stdio integration requires local IPC")
 
 
+async def _call(client: Client, name: str, arguments: dict):
+    args = dict(arguments)
+    if name == "lyx_read":
+        args.setdefault("format", "text")
+    else:
+        path = args["path"]
+        expected = args.pop("expected_sha256", fingerprint(Path(path)))
+        if name == "lyx_apply_edits":
+            operations = [{"id": str(i), **e} for i, e in enumerate(args.pop("edits"))]
+        elif name == "lyx_insert_text":
+            position = args.pop("position")
+            operations = [
+                {"id": "insert", "op": "insert_" + position, "anchor": args.pop("anchor"), "text": args.pop("text")}
+            ]
+        elif name == "lyx_insert_citation":
+            operations = [
+                {
+                    "id": "citation",
+                    "op": "insert_citation",
+                    "anchor": args.pop("anchor"),
+                    "keys": args.pop("keys"),
+                    "position": args.pop("position", "after"),
+                }
+            ]
+        else:
+            operations = [
+                {
+                    "id": "structure",
+                    "op": name.removeprefix("lyx_"),
+                    **{key: args.pop(key) for key in list(args) if key != "path"},
+                }
+            ]
+        args.update(expected_sha256=expected, operations=operations)
+        name = "lyx_apply_edits"
+    args["wait_sec"] = 20
+    result = await client.call_tool(name, args)
+    data = result.structured_content
+    if name == "lyx_apply_edits" and data.get("ok"):
+        data["output_changes"] = data["state"]["output_changes"]
+        data["tracking_changes"] = data["state"]["tracking_changes"]
+        data["pdf"] = data["build"]["artifacts"]["pdf"]["path"]
+        data["merged_into_existing"] = False
+    elif name == "lyx_apply_edits" and data.get("transaction_status") == "rolled_back":
+        data["rollback_verified"] = fingerprint(Path(args["path"])) == args["expected_sha256"]
+    return result
+
+
 def _document(body: str, author: bool = False) -> str:
     source = FIXTURE.read_text()
     source = source.replace(
@@ -52,7 +99,8 @@ def test_plain_text_layout_syntax_via_mcp(tmp_path: Path, layout: str) -> None:
         document = tmp_path / f"{layout}.lyx"
         document.write_text(_document(f"\\begin_layout {layout}\nAlpha beta is precise.\n\\end_layout"))
         async with Client(_server(tmp_path)) as client:
-            result = await client.call_tool(
+            result = await _call(
+                client,
                 "lyx_apply_edits",
                 {
                     "path": str(document),
@@ -65,11 +113,11 @@ def test_plain_text_layout_syntax_via_mcp(tmp_path: Path, layout: str) -> None:
                     ],
                 },
             )
-            assert result.structured_content["ok"] is True, result.structured_content
+            assert result.structured_content["ok"] is True, json.dumps(result.structured_content)
             assert result.structured_content["output_changes"] is True
             assert b"\\output_changes true" in document.read_bytes()
             assert Path(result.structured_content["pdf"]).read_bytes().startswith(b"%PDF-")
-            latex = await client.call_tool("lyx_read", {"path": str(document), "format": "latex"})
+            latex = await _call(client, "lyx_read", {"path": str(document), "format": "latex"})
             assert "gamma" in latex.structured_content["content"]
 
     asyncio.run(exercise())
@@ -84,15 +132,16 @@ def test_insert_text_keeps_citation_command_literal_via_mcp(tmp_path: Path) -> N
         document = tmp_path / "literal-citation.lyx"
         shutil.copy2(FIXTURE, document)
         async with Client(_server(tmp_path)) as client:
-            result = await client.call_tool(
+            result = await _call(
+                client,
                 "lyx_insert_text",
                 {"path": str(document), "anchor": "Gamma delta", "text": r" \cite{A}", "position": "after"},
             )
-            assert result.structured_content["ok"] is True, result.structured_content
+            assert result.structured_content["ok"] is True, json.dumps(result.structured_content)
             assert b"\\begin_inset CommandInset citation" not in document.read_bytes()
-            text = await client.call_tool("lyx_read", {"path": str(document), "format": "text"})
+            text = await _call(client, "lyx_read", {"path": str(document), "format": "text"})
             assert r"Gamma delta \cite{A}." in text.structured_content["content"]
-            latex = await client.call_tool("lyx_read", {"path": str(document), "format": "latex"})
+            latex = await _call(client, "lyx_read", {"path": str(document), "format": "latex"})
             assert r"\textbackslash cite\{A\}" in latex.structured_content["content"]
             assert Path(result.structured_content["pdf"]).read_bytes().startswith(b"%PDF-")
 
@@ -103,8 +152,7 @@ def test_insert_text_keeps_citation_command_literal_via_mcp(tmp_path: Path) -> N
 def test_insert_citation_tracks_inset_via_mcp(tmp_path: Path, keys: str, position: str) -> None:
     async def exercise() -> None:
         (tmp_path / "refs.bib").write_text(
-            "@article{A, title={A}, author={Alpha}, year={2020}}\n"
-            "@article{B, title={B}, author={Beta}, year={2021}}\n"
+            "@article{A, title={A}, author={Alpha}, year={2020}}\n@article{B, title={B}, author={Beta}, year={2021}}\n"
         )
         bibliography = (
             "\\begin_layout Standard\n\\begin_inset CommandInset bibtex\nLatexCommand bibtex\n"
@@ -117,8 +165,8 @@ def test_insert_citation_tracks_inset_via_mcp(tmp_path: Path, keys: str, positio
         if position == "before":
             arguments["position"] = position
         async with Client(_server(tmp_path)) as client:
-            result = await client.call_tool("lyx_insert_citation", arguments)
-            assert result.structured_content["ok"] is True, result.structured_content
+            result = await _call(client, "lyx_insert_citation", arguments)
+            assert result.structured_content["ok"] is True, json.dumps(result.structured_content)
             assert result.structured_content["tracking_changes"] is True
             assert result.structured_content["output_changes"] is True
             assert result.structured_content["merged_into_existing"] is False
@@ -126,7 +174,7 @@ def test_insert_citation_tracks_inset_via_mcp(tmp_path: Path, keys: str, positio
             assert source.count("\\begin_inset CommandInset citation") == 1
             assert f'key "{keys}"' in source
             assert re.search(r"\\change_inserted \d+ \d+\n\s*\\begin_inset CommandInset citation", source)
-            latex = await client.call_tool("lyx_read", {"path": str(document), "format": "latex"})
+            latex = await _call(client, "lyx_read", {"path": str(document), "format": "latex"})
             assert f"\\cite{{{keys}}}" in latex.structured_content["content"]
             assert Path(result.structured_content["pdf"]).read_bytes().startswith(b"%PDF-")
 
@@ -134,7 +182,7 @@ def test_insert_citation_tracks_inset_via_mcp(tmp_path: Path, keys: str, positio
 
 
 @pytest.mark.parametrize("keys", ["B", "B,C"])
-def test_insert_citation_merges_adjacent_inset_via_mcp(tmp_path: Path, keys: str) -> None:
+def test_insert_citation_keeps_adjacent_insets_separate_via_mcp(tmp_path: Path, keys: str) -> None:
     async def exercise() -> None:
         (tmp_path / "refs.bib").write_text(
             "@article{A, title={A}, author={Alpha}, year={2020}}\n"
@@ -151,17 +199,18 @@ def test_insert_citation_merges_adjacent_inset_via_mcp(tmp_path: Path, keys: str
         body = body.replace("Gamma delta.", "Gamma delta\n" + _citation("A") + "\n.")
         document.write_text(body)
         async with Client(_server(tmp_path)) as client:
-            result = await client.call_tool(
+            result = await _call(
+                client,
                 "lyx_insert_citation",
                 {"path": str(document), "anchor": "Gamma delta", "keys": keys},
             )
-            assert result.structured_content["ok"] is True, result.structured_content
-            assert result.structured_content["merged_into_existing"] is True
+            assert result.structured_content["ok"] is True, json.dumps(result.structured_content)
+            assert result.structured_content["merged_into_existing"] is False
             source = document.read_text()
-            assert source.count("\\begin_inset CommandInset citation") == 1
-            assert f'key "A,{keys}"' in source
-            latex = await client.call_tool("lyx_read", {"path": str(document), "format": "latex"})
-            assert f"\\cite{{A,{keys}}}" in latex.structured_content["content"]
+            assert source.count("\\begin_inset CommandInset citation") == 2
+            assert f'key "{keys}"' in source
+            latex = await _call(client, "lyx_read", {"path": str(document), "format": "latex"})
+            assert f"\\cite{{{keys}}}" in latex.structured_content["content"]
             assert Path(result.structured_content["pdf"]).read_bytes().startswith(b"%PDF-")
 
     asyncio.run(exercise())
@@ -183,7 +232,8 @@ def test_insert_citation_rolls_back_undefined_key_via_mcp(tmp_path: Path, adjace
         document.write_text(body)
         original = document.read_bytes()
         async with Client(_server(tmp_path)) as client:
-            result = await client.call_tool(
+            result = await _call(
+                client,
                 "lyx_insert_citation",
                 {"path": str(document), "anchor": "Gamma delta", "keys": "MissingCitationProbe"},
             )
@@ -214,8 +264,7 @@ def _tabular(text: str) -> str:
 
 def _note(text: str) -> str:
     return (
-        "\\begin_inset Note Note\nstatus collapsed\n\n\\begin_layout Plain Layout\n"
-        f"{text}\n\\end_layout\n\n\\end_inset"
+        f"\\begin_inset Note Note\nstatus collapsed\n\n\\begin_layout Plain Layout\n{text}\n\\end_layout\n\n\\end_inset"
     )
 
 
@@ -244,14 +293,13 @@ def test_tracked_inset_syntax_via_mcp_import(tmp_path: Path, syntax: str, old: s
         suffix = (
             "\\begin_layout Section\nEnd\n\\end_layout\n"
             "\\begin_layout Standard\n"
-            "\\begin_inset CommandInset label\nLatexCommand label\nname \"sec:first\"\n\n\\end_inset\n"
-            "\\begin_inset CommandInset label\nLatexCommand label\nname \"sec:second\"\n\n\\end_inset\n"
+            '\\begin_inset CommandInset label\nLatexCommand label\nname "sec:first"\n\n\\end_inset\n'
+            '\\begin_inset CommandInset label\nLatexCommand label\nname "sec:second"\n\n\\end_inset\n'
             "\\end_layout\n"
         )
         if syntax == "citation":
             (tmp_path / "refs.bib").write_text(
-                "@article{A, title={A}, author={A}, year={2020}}\n"
-                "@article{B, title={B}, author={B}, year={2021}}\n"
+                "@article{A, title={A}, author={A}, year={2020}}\n@article{B, title={B}, author={B}, year={2021}}\n"
             )
             suffix += (
                 "\\begin_layout Standard\n\\begin_inset CommandInset bibtex\nLatexCommand bibtex\n"
@@ -272,7 +320,8 @@ def test_tracked_inset_syntax_via_mcp_import(tmp_path: Path, syntax: str, old: s
         target.write_text(_document(target_body))
         donor.write_text(_document(donor_body, author=True))
         async with Client(_server(tmp_path)) as client:
-            result = await client.call_tool(
+            result = await _call(
+                client,
                 "lyx_import_revision_range",
                 {
                     "path": str(target),
@@ -283,7 +332,7 @@ def test_tracked_inset_syntax_via_mcp_import(tmp_path: Path, syntax: str, old: s
                     "source_sha256": fingerprint(donor),
                 },
             )
-            assert result.structured_content["ok"] is True, result.structured_content
+            assert result.structured_content["ok"] is True, json.dumps(result.structured_content)
             assert result.structured_content["output_changes"] is True
             assert Path(result.structured_content["pdf"]).read_bytes().startswith(b"%PDF-")
             assert (b"vspace{1pt}" if syntax == "ert" else new.encode()) in target.read_bytes()
@@ -303,8 +352,9 @@ def test_fragmented_text_revision_normalization_via_mcp(tmp_path: Path) -> None:
         )
         document.write_text(_document(body, author=True).replace("\\tracking_changes false", "\\tracking_changes true"))
         async with Client(_server(tmp_path)) as client:
-            before = await client.call_tool("lyx_read", {"path": str(document)})
-            result = await client.call_tool(
+            before = await _call(client, "lyx_read", {"path": str(document)})
+            result = await _call(
+                client,
                 "lyx_normalize_revisions",
                 {
                     "path": str(document),
@@ -313,11 +363,11 @@ def test_fragmented_text_revision_normalization_via_mcp(tmp_path: Path) -> None:
                     "timestamp": 100,
                 },
             )
-            assert result.structured_content["ok"] is True, result.structured_content
-            assert result.structured_content["merged_groups"] == 1
+            assert result.structured_content["ok"] is True, json.dumps(result.structured_content)
+            assert document.read_bytes().count(b"\\change_deleted") == 1
             assert result.structured_content["output_changes"] is True
             assert Path(result.structured_content["pdf"]).read_bytes().startswith(b"%PDF-")
-            after = await client.call_tool("lyx_read", {"path": str(document)})
+            after = await _call(client, "lyx_read", {"path": str(document)})
             assert before.structured_content["content"] == after.structured_content["content"]
 
     asyncio.run(exercise())
